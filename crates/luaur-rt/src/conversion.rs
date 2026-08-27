@@ -286,19 +286,19 @@ impl FromLua for f32 {
 
 impl IntoLua for String {
     fn into_lua(self, lua: &Lua) -> Result<Value> {
-        Ok(Value::String(lua.create_string(&self)))
+        Ok(Value::String(lua.create_string(&self)?))
     }
 }
 
 impl IntoLua for &str {
     fn into_lua(self, lua: &Lua) -> Result<Value> {
-        Ok(Value::String(lua.create_string(self)))
+        Ok(Value::String(lua.create_string(self)?))
     }
 }
 
 impl IntoLua for &String {
     fn into_lua(self, lua: &Lua) -> Result<Value> {
-        Ok(Value::String(lua.create_string(self)))
+        Ok(Value::String(lua.create_string(self)?))
     }
 }
 
@@ -334,8 +334,8 @@ impl FromLua for LuaString {
     fn from_lua(value: Value, _lua: &Lua) -> Result<Self> {
         match value {
             Value::String(s) => Ok(s),
-            Value::Integer(i) => Ok(_lua.create_string(i.to_string())),
-            Value::Number(n) => Ok(_lua.create_string(n.to_string())),
+            Value::Integer(i) => Ok(_lua.create_string(i.to_string())?),
+            Value::Number(n) => Ok(_lua.create_string(n.to_string())?),
             other => Err(Error::FromLuaConversionError {
                 from: other.type_name(),
                 to: "String".to_string(),
@@ -733,7 +733,7 @@ impl<T: FromLua> Iterator for SetIter<T> {
 
 impl IntoLua for char {
     fn into_lua(self, lua: &Lua) -> Result<Value> {
-        Ok(Value::String(lua.create_string(self.to_string())))
+        Ok(Value::String(lua.create_string(self.to_string())?))
     }
 }
 
@@ -777,13 +777,13 @@ impl FromLua for char {
 
 impl IntoLua for std::borrow::Cow<'_, str> {
     fn into_lua(self, lua: &Lua) -> Result<Value> {
-        Ok(Value::String(lua.create_string(self.as_ref())))
+        Ok(Value::String(lua.create_string(self.as_ref())?))
     }
 }
 
 impl IntoLua for Box<str> {
     fn into_lua(self, lua: &Lua) -> Result<Value> {
-        Ok(Value::String(lua.create_string(&*self)))
+        Ok(Value::String(lua.create_string(&*self)?))
     }
 }
 
@@ -795,7 +795,7 @@ impl FromLua for Box<str> {
 
 impl IntoLua for std::ffi::CString {
     fn into_lua(self, lua: &Lua) -> Result<Value> {
-        Ok(Value::String(lua.create_string(self.as_bytes())))
+        Ok(Value::String(lua.create_string(self.as_bytes())?))
     }
 }
 

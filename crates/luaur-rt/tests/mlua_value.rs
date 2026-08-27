@@ -151,7 +151,7 @@ fn test_value_to_string() -> Result<()> {
     assert_eq!(Value::Number(34.59).to_string()?, "34.59");
     assert_eq!(Value::Number(34.59).type_name(), "number");
 
-    let s = Value::String(lua.create_string("hello"));
+    let s = Value::String(lua.create_string("hello")?);
     assert_eq!(s.to_string()?, "hello");
     assert_eq!(s.type_name(), "string");
 
@@ -193,15 +193,15 @@ fn test_value_conversions() -> Result<()> {
     assert_eq!(Value::Number(1.23).as_number(), Some(1.23));
     assert_eq!(Value::Number(1.23).as_f32(), Some(1.23f32));
     assert_eq!(Value::Number(1.23).as_f64(), Some(1.23f64));
-    assert!(Value::String(lua.create_string("hello")).is_string());
+    assert!(Value::String(lua.create_string("hello")?).is_string());
     assert_eq!(
-        Value::String(lua.create_string("hello"))
+        Value::String(lua.create_string("hello")?)
             .as_string()
             .unwrap(),
         "hello"
     );
     assert_eq!(
-        Value::String(lua.create_string("hello")).to_string()?,
+        Value::String(lua.create_string("hello")?).to_string()?,
         "hello"
     );
     assert!(Value::Table(lua.create_table()).is_table());

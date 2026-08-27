@@ -91,7 +91,7 @@ fn test_multivalue_by_ref() -> Result<()> {
     let lua = Lua::new();
     let multi = MultiValue::from_vec(vec![
         Value::Integer(3),
-        Value::String(lua.create_string("hello")),
+        Value::String(lua.create_string("hello")?),
         Value::Boolean(true),
     ]);
 

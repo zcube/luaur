@@ -154,12 +154,12 @@ impl<'a> ser::Serializer for Serializer<'a> {
 
     #[inline]
     fn serialize_str(self, value: &str) -> Result<Value> {
-        Ok(Value::String(self.lua.create_string(value)))
+        Ok(Value::String(self.lua.create_string(value)?))
     }
 
     #[inline]
     fn serialize_bytes(self, value: &[u8]) -> Result<Value> {
-        Ok(Value::String(self.lua.create_string(value)))
+        Ok(Value::String(self.lua.create_string(value)?))
     }
 
     #[inline]

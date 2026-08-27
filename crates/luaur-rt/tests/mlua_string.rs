@@ -15,7 +15,7 @@ fn test_string_compare() {
     let lua = Lua::new();
 
     fn with_str<F: FnOnce(LuaString)>(lua: &Lua, s: &str, f: F) {
-        f(lua.create_string(s));
+        f(lua.create_string(s).unwrap());
     }
 
     // Tests that all comparisons we want to have are usable
@@ -91,7 +91,7 @@ fn test_string_views() -> Result<()> {
 fn test_string_from_bytes() -> Result<()> {
     let lua = Lua::new();
 
-    let rs = lua.create_string([0, 1, 2, 3, 0, 1, 2, 3]);
+    let rs = lua.create_string([0, 1, 2, 3, 0, 1, 2, 3])?;
     assert_eq!(rs.as_bytes(), vec![0, 1, 2, 3, 0, 1, 2, 3]);
 
     Ok(())
@@ -105,11 +105,11 @@ fn test_string_hash() -> Result<()> {
         .load(r#"return {"hello", "world", "abc", 321}"#)
         .eval()?;
     assert_eq!(set.len(), 4);
-    assert!(set.contains(&lua.create_string("hello")));
-    assert!(set.contains(&lua.create_string("world")));
-    assert!(set.contains(&lua.create_string("abc")));
-    assert!(set.contains(&lua.create_string("321")));
-    assert!(!set.contains(&lua.create_string("Hello")));
+    assert!(set.contains(&lua.create_string("hello")?));
+    assert!(set.contains(&lua.create_string("world")?));
+    assert!(set.contains(&lua.create_string("abc")?));
+    assert!(set.contains(&lua.create_string("321")?));
+    assert!(!set.contains(&lua.create_string("Hello")?));
 
     Ok(())
 }
@@ -119,13 +119,13 @@ fn test_string_fmt_debug() -> Result<()> {
     let lua = Lua::new();
 
     // Valid utf8
-    let s = lua.create_string("hello");
+    let s = lua.create_string("hello")?;
     assert_eq!(format!("{s:?}"), r#""hello""#);
     assert_eq!(format!("{:?}", s.to_str()?), r#""hello""#);
     assert_eq!(format!("{:?}", s.as_bytes()), "[104, 101, 108, 108, 111]");
 
     // Invalid utf8
-    let s = lua.create_string(b"hello\0world\r\n\t\xf0\x90\x80");
+    let s = lua.create_string(b"hello\0world\r\n\t\xf0\x90\x80")?;
     assert_eq!(format!("{s:?}"), r#"b"hello\0world\r\n\t\xf0\x90\x80""#);
 
     Ok(())
@@ -135,8 +135,8 @@ fn test_string_fmt_debug() -> Result<()> {
 fn test_string_pointer() -> Result<()> {
     let lua = Lua::new();
 
-    let str1 = lua.create_string("hello");
-    let str2 = lua.create_string("hello");
+    let str1 = lua.create_string("hello")?;
+    let str2 = lua.create_string("hello")?;
 
     // Lua uses string interning, so these should be the same
     assert_eq!(str1.to_pointer(), str2.to_pointer());
@@ -148,11 +148,11 @@ fn test_string_pointer() -> Result<()> {
 fn test_string_display() -> Result<()> {
     let lua = Lua::new();
 
-    let s = lua.create_string("hello");
+    let s = lua.create_string("hello")?;
     assert_eq!(format!("{}", s.display()), "hello");
 
     // With invalid utf8
-    let s = lua.create_string(b"hello\0world\xFF");
+    let s = lua.create_string(b"hello\0world\xFF")?;
     assert_eq!(format!("{}", s.display()), "hello\0world\u{fffd}");
 
     Ok(())
@@ -162,7 +162,7 @@ fn test_string_display() -> Result<()> {
 fn test_bytes_into_iter() -> Result<()> {
     let lua = Lua::new();
 
-    let s = lua.create_string("hello");
+    let s = lua.create_string("hello")?;
     let bytes = s.as_bytes();
 
     for (i, &b) in bytes.iter().enumerate() {

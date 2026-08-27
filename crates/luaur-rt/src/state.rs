@@ -336,6 +336,14 @@ impl Default for Lua {
     }
 }
 
+// mlua's `Lua` derives `Debug` (printing its interior pointer); mirror that so
+// downstream types can keep `#[derive(Debug)]` over a wrapped `Lua`.
+impl std::fmt::Debug for Lua {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Lua({:p})", self.inner.state)
+    }
+}
+
 impl Lua {
     /// A non-owning, weak handle to this VM. Mirrors `mlua::Lua::weak`.
     ///
@@ -413,9 +421,11 @@ impl Lua {
 
     /// Create a Lua string from bytes/str.
     ///
-    /// Mirrors `mlua::Lua::create_string`.
-    pub fn create_string(&self, s: impl AsRef<[u8]>) -> LuaString {
-        crate::string::create_string(self, s.as_ref())
+    /// Mirrors `mlua::Lua::create_string` — including its `Result` return, so
+    /// mlua code calling `lua.create_string(..)?` ports verbatim. (luaur's
+    /// string interning cannot in fact fail short of OOM, which aborts.)
+    pub fn create_string(&self, s: impl AsRef<[u8]>) -> Result<LuaString> {
+        Ok(crate::string::create_string(self, s.as_ref()))
     }
 
     /// Create a table and populate it from an iterator of key/value pairs.
@@ -584,10 +594,10 @@ impl Lua {
     ///
     /// Mirrors `mlua::Lua::load`. Returns a [`Chunk`]; finalize with
     /// [`Chunk::exec`] / [`Chunk::eval`] / [`Chunk::into_function`].
-    pub fn load(&self, source: impl AsRef<str>) -> Chunk {
+    pub fn load(&self, source: impl crate::chunk::AsChunk) -> Chunk {
         Chunk {
             lua: self.clone(),
-            source: source.as_ref().to_string(),
+            source: source.into_chunk_source(),
             name: "chunk".to_string(),
             environment: None,
             compiler: None,

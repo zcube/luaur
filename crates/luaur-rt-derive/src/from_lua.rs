@@ -4,8 +4,8 @@
 //! Faithful port of mlua's `from_lua` derive (`mlua_derive/src/from_lua.rs`):
 //! same `Self: 'static + Clone` bound, same match on the userdata value, same
 //! `FromLuaConversionError` shape for any other value type. Only the crate path
-//! (`::luaur_rt` instead of `::mlua`) and luaur-rt's slightly different
-//! `Value`/`Error` field layout differ.
+//! (luaur-rt, resolved via `crate::runtime_path` so dependency renames work)
+//! and luaur-rt's slightly different `Value`/`Error` field layout differ.
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -25,13 +25,15 @@ pub fn from_lua(input: TokenStream) -> TokenStream {
         .push(parse_quote!(Self: 'static + Clone));
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
+    let rt = crate::runtime_path();
+
     quote! {
-        impl #impl_generics ::luaur_rt::FromLua for #ident #ty_generics #where_clause {
+        impl #impl_generics #rt::FromLua for #ident #ty_generics #where_clause {
             #[inline]
-            fn from_lua(value: ::luaur_rt::Value, _: &::luaur_rt::Lua) -> ::luaur_rt::Result<Self> {
+            fn from_lua(value: #rt::Value, _: &#rt::Lua) -> #rt::Result<Self> {
                 match value {
-                    ::luaur_rt::Value::UserData(ud) => Ok(ud.borrow::<Self>()?.clone()),
-                    _ => Err(::luaur_rt::Error::FromLuaConversionError {
+                    #rt::Value::UserData(ud) => Ok(ud.borrow::<Self>()?.clone()),
+                    _ => Err(#rt::Error::FromLuaConversionError {
                         from: value.type_name(),
                         to: #ident_str.to_string(),
                         message: None,

@@ -22,7 +22,8 @@
 use std::sync::Arc;
 
 use luaur_rt::{
-    Error, Function, Lua, MetaMethod, Result, UserData, UserDataFields, UserDataMethods, Variadic,
+    AnyUserData, Error, Function, Lua, MetaMethod, MultiValue, Result, UserData, UserDataFields,
+    UserDataMethods, Value, Variadic,
 };
 
 #[test]
@@ -472,4 +473,74 @@ fn test_meta_index_scoped_userdata() -> Result<()> {
         assert_eq!(lua.load("return ud.zzz").eval::<String>()?, "dyn:zzz");
         Ok(())
     })
+}
+
+// ---------------------------------------------------------------------------
+// `add_meta_function` / `add_meta_function_mut` (mlua parity): the meta-method
+// registered as a *plain function* — the receiver is not split off, every
+// argument (receiver included) reaches the closure. This is the surface
+// bevy_mod_scripting's Lua layer uses for its 14 `add_meta_function` call
+// sites (previously recreated downstream via an `add_meta_method` shim).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_add_meta_function() -> Result<()> {
+    struct Val(i64);
+
+    impl UserData for Val {
+        fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+            // Receiver-first shape: `ud - n`.
+            methods.add_meta_function(MetaMethod::Sub, |_, (a, b): (AnyUserData, i64)| {
+                Ok(a.borrow::<Val>()?.0 - b)
+            });
+            // Raw shape: Lua may call `__concat` with the userdata as either
+            // operand; take both as `Value` and sort it out.
+            methods.add_meta_function(MetaMethod::Concat, |lua, (a, b): (Value, Value)| {
+                let side = |v: &Value| match v {
+                    Value::UserData(u) => u.borrow::<Val>().map(|v| v.0.to_string()),
+                    other => Ok(other.to_string().unwrap_or_default()),
+                };
+                let joined = format!("{}{}", side(&a)?, side(&b)?);
+                Ok(lua.create_string(joined)?)
+            });
+            // The luaur_compat probe: `__index` registered as a meta function
+            // must actually be consulted for unknown keys.
+            methods.add_meta_function(MetaMethod::Index, |_, (_this, key): (Value, String)| {
+                Ok(format!("seen:{key}"))
+            });
+        }
+    }
+
+    let lua = Lua::new();
+    lua.globals().set("v", lua.create_userdata(Val(10))?)?;
+
+    assert_eq!(lua.load("return v - 3").eval::<i64>()?, 7);
+    assert_eq!(lua.load("return v .. \"!\"").eval::<String>()?, "10!");
+    assert_eq!(lua.load("return \"=\" .. v").eval::<String>()?, "=10");
+    assert_eq!(
+        lua.load("return v.get_type_by_name").eval::<String>()?,
+        "seen:get_type_by_name"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_add_meta_function_mut() -> Result<()> {
+    struct Counted;
+
+    impl UserData for Counted {
+        fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+            let mut calls = 0i64;
+            methods.add_meta_function_mut(MetaMethod::Call, move |_, _args: MultiValue| {
+                calls += 1;
+                Ok(calls)
+            });
+        }
+    }
+
+    let lua = Lua::new();
+    lua.globals().set("c", lua.create_userdata(Counted)?)?;
+    assert_eq!(lua.load("return c()").eval::<i64>()?, 1);
+    assert_eq!(lua.load("return c()").eval::<i64>()?, 2);
+    Ok(())
 }

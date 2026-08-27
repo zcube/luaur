@@ -16,3 +16,7 @@ proc-macro = true
 syn = { version = "2.0", features = ["full"] }
 quote = "1.0"
 proc-macro2 = "1.0"
+# Resolves the runtime crate's real name in the *user's* Cargo.toml, so the
+# emitted paths keep working when luaur-rt is renamed — e.g.
+# `mlua = { package = "luaur-rt", .. }` in an mlua-drop-in embedding.
+proc-macro-crate = "3"

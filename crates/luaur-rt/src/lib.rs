@@ -129,7 +129,7 @@ mod value;
 mod vector;
 
 pub use buffer::Buffer;
-pub use chunk::{Chunk, ChunkMode};
+pub use chunk::{AsChunk, Chunk, ChunkMode};
 pub use compiler::Compiler;
 pub use debug::{Debug, DebugWhat};
 pub use error::{Error, ExternalError, ExternalResult, Result};

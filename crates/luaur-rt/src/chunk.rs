@@ -21,13 +21,83 @@ impl BytecodeEncoder for NoopEncoder {
     fn encode(&mut self, _data: &mut [u32]) {}
 }
 
+/// Input accepted by [`Lua::load`]: source text as a string or as raw bytes.
+///
+/// Mirrors the text half of `mlua::AsChunk` (mlua additionally accepts
+/// precompiled bytecode and file paths; luaur-rt's high-level loader is
+/// text-only, see [`ChunkMode`]). Bytes are validated as UTF-8 — luaur's
+/// parser operates on `str` — and an invalid sequence is deferred into the
+/// [`Chunk`], surfacing as a [`Error::SyntaxError`] when the chunk is
+/// compiled (exactly where mlua's Luau parser would reject it).
+pub trait AsChunk {
+    /// The chunk's source text, or the position of the first invalid UTF-8
+    /// byte (reported when the chunk is compiled).
+    fn into_chunk_source(self) -> std::result::Result<String, std::str::Utf8Error>;
+}
+
+impl AsChunk for &str {
+    fn into_chunk_source(self) -> std::result::Result<String, std::str::Utf8Error> {
+        Ok(self.to_string())
+    }
+}
+
+impl AsChunk for String {
+    fn into_chunk_source(self) -> std::result::Result<String, std::str::Utf8Error> {
+        Ok(self)
+    }
+}
+
+impl AsChunk for &String {
+    fn into_chunk_source(self) -> std::result::Result<String, std::str::Utf8Error> {
+        Ok(self.clone())
+    }
+}
+
+impl AsChunk for std::borrow::Cow<'_, str> {
+    fn into_chunk_source(self) -> std::result::Result<String, std::str::Utf8Error> {
+        Ok(self.into_owned())
+    }
+}
+
+impl AsChunk for &[u8] {
+    fn into_chunk_source(self) -> std::result::Result<String, std::str::Utf8Error> {
+        std::str::from_utf8(self).map(str::to_string)
+    }
+}
+
+impl AsChunk for &Vec<u8> {
+    fn into_chunk_source(self) -> std::result::Result<String, std::str::Utf8Error> {
+        self.as_slice().into_chunk_source()
+    }
+}
+
+impl AsChunk for Vec<u8> {
+    fn into_chunk_source(self) -> std::result::Result<String, std::str::Utf8Error> {
+        match String::from_utf8(self) {
+            Ok(s) => Ok(s),
+            Err(e) => Err(e.utf8_error()),
+        }
+    }
+}
+
+impl AsChunk for std::borrow::Cow<'_, [u8]> {
+    fn into_chunk_source(self) -> std::result::Result<String, std::str::Utf8Error> {
+        match self {
+            std::borrow::Cow::Borrowed(b) => b.into_chunk_source(),
+            std::borrow::Cow::Owned(v) => v.into_chunk_source(),
+        }
+    }
+}
+
 /// A not-yet-executed piece of Lua source.
 ///
 /// Mirrors `mlua::Chunk`. Produced by [`Lua::load`]; finalized with
 /// [`Chunk::exec`], [`Chunk::eval`], or [`Chunk::into_function`].
 pub struct Chunk {
     pub(crate) lua: Lua,
-    pub(crate) source: String,
+    /// The source text, or the deferred invalid-UTF-8 error from a bytes
+    /// [`AsChunk`] input (reported by [`Chunk::compile`]).
+    pub(crate) source: std::result::Result<String, std::str::Utf8Error>,
     pub(crate) name: String,
     /// Optional environment table applied to the loaded function. Mirrors the
     /// per-chunk environment set by `mlua::Chunk::set_environment`.
@@ -96,7 +166,10 @@ impl Chunk {
         };
         let parse_options = ParseOptions::default();
         let mut encoder = NoopEncoder;
-        let owned = self.source.clone();
+        let owned = match &self.source {
+            Ok(s) => s.clone(),
+            Err(e) => return Err(invalid_utf8_error(e)),
+        };
         let blob = compiler_compile(
             &owned,
             &options,
@@ -170,7 +243,10 @@ impl Chunk {
     #[cfg(feature = "typecheck")]
     #[cfg_attr(docsrs, doc(cfg(feature = "typecheck")))]
     pub fn check(&self) -> Result<()> {
-        self.lua.check(&self.source)
+        match &self.source {
+            Ok(s) => self.lua.check(s),
+            Err(e) => Err(invalid_utf8_error(e)),
+        }
     }
 
     /// Run the chunk for its side effects, discarding return values.
@@ -192,7 +268,7 @@ impl Chunk {
         // Try the expression form first.
         let expr = Chunk {
             lua: self.lua.clone(),
-            source: format!("return {}", self.source),
+            source: self.source.clone().map(|s| format!("return {s}")),
             name: self.name.clone(),
             environment: self.environment.clone(),
             compiler: self.compiler.clone(),
@@ -239,7 +315,7 @@ impl Chunk {
         // Try the expression form first (mirrors `eval`).
         let expr = Chunk {
             lua: self.lua.clone(),
-            source: format!("return {}", self.source),
+            source: self.source.clone().map(|s| format!("return {s}")),
             name: self.name.clone(),
             environment: self.environment.clone(),
             compiler: self.compiler.clone(),
@@ -261,4 +337,14 @@ pub enum ChunkMode {
     Text,
     /// Precompiled bytecode (not supported by luaur-rt's high-level loader).
     Binary,
+}
+
+/// The deferred error for byte chunks that are not valid UTF-8: shaped as a
+/// [`Error::SyntaxError`], since that is where mlua's Luau parser (which takes
+/// the raw bytes) would reject the same input.
+fn invalid_utf8_error(e: &std::str::Utf8Error) -> Error {
+    Error::SyntaxError {
+        message: format!("chunk source is not valid UTF-8: {e}"),
+        incomplete_input: false,
+    }
 }

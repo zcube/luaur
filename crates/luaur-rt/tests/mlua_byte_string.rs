@@ -9,7 +9,7 @@
 // `&BStr` conversions are deferred. The *capability the test proves* — that
 // luaur-rt's `LuaString` faithfully stores and round-trips arbitrary raw bytes,
 // including invalid UTF-8 — is exercised here directly through `LuaString`
-// (`as_bytes`, byte comparisons, `Debug`) and `Lua::create_string(bytes)`. This
+// (`as_bytes`, byte comparisons, `Debug`) and `Lua::create_string(bytes)?`. This
 // is the honest, native-types form of the same round-trip.
 
 use luaur_rt::{Lua, LuaString, Result};
@@ -62,14 +62,14 @@ fn test_byte_string_round_trip() -> Result<()> {
 
     // Set the raw bytes back into Lua under new names and assert (in Lua) that
     // they compare equal to the originals — the round-trip is byte-exact.
-    globals.set("rt_isi", lua.create_string(isi.as_bytes()))?;
-    globals.set("rt_i2os2", lua.create_string(i2os2.as_bytes()))?;
-    globals.set("rt_i3os2", lua.create_string(i3os2.as_bytes()))?;
-    globals.set("rt_i3os3", lua.create_string(i3os3.as_bytes()))?;
-    globals.set("rt_i4os2", lua.create_string(i4os2.as_bytes()))?;
-    globals.set("rt_i4os3", lua.create_string(i4os3.as_bytes()))?;
-    globals.set("rt_i4os4", lua.create_string(i4os4.as_bytes()))?;
-    globals.set("rt_aas", lua.create_string(aas.as_bytes()))?;
+    globals.set("rt_isi", lua.create_string(isi.as_bytes())?)?;
+    globals.set("rt_i2os2", lua.create_string(i2os2.as_bytes())?)?;
+    globals.set("rt_i3os2", lua.create_string(i3os2.as_bytes())?)?;
+    globals.set("rt_i3os3", lua.create_string(i3os3.as_bytes())?)?;
+    globals.set("rt_i4os2", lua.create_string(i4os2.as_bytes())?)?;
+    globals.set("rt_i4os3", lua.create_string(i4os3.as_bytes())?)?;
+    globals.set("rt_i4os4", lua.create_string(i4os4.as_bytes())?)?;
+    globals.set("rt_aas", lua.create_string(aas.as_bytes())?)?;
 
     lua.load(
         r#"
@@ -94,7 +94,7 @@ fn test_byte_string_comparisons_and_debug() -> Result<()> {
     // and a non-panicking lossy `Debug` over invalid UTF-8.
     let lua = Lua::new();
 
-    let s = lua.create_string([0xff, 0x00, 0xfe, b'a']);
+    let s = lua.create_string([0xff, 0x00, 0xfe, b'a'])?;
     assert_eq!(s.as_bytes(), [0xff, 0x00, 0xfe, b'a']);
     assert_eq!(s.as_bytes(), vec![0xff, 0x00, 0xfe, b'a']);
     assert_ne!(s.as_bytes(), b"abc");
@@ -104,7 +104,7 @@ fn test_byte_string_comparisons_and_debug() -> Result<()> {
     assert!(!dbg.is_empty());
 
     // A valid-UTF-8 string also exposes `to_str`.
-    let valid = lua.create_string("héllo");
+    let valid = lua.create_string("héllo")?;
     assert_eq!(valid.to_str()?, "héllo");
 
     Ok(())
