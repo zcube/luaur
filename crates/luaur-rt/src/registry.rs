@@ -15,7 +15,7 @@
 
 use crate::error::{Error, Result};
 use crate::state::{Lua, LuaRef};
-use crate::sync::{NotSync, XRc, NOT_SYNC};
+use crate::sync::XRc;
 use crate::traits::{FromLua, IntoLua};
 use crate::value::Value;
 
@@ -25,19 +25,17 @@ use crate::value::Value;
 /// stored value (the slot is shared via `Rc`). The value stays alive until the
 /// last clone is dropped or it is explicitly removed.
 ///
-/// Under the `send` feature it is `Send` but never `Sync` — see
-/// [`crate::sync::NotSync`].
+/// Under the `send` feature it is `Send + Sync` (all VM access is
+/// serialized by the per-VM lock — see [`crate::state::StateRef`]).
 #[derive(Clone)]
 pub struct RegistryKey {
     pub(crate) reference: XRc<LuaRef>,
-    pub(crate) _not_sync: NotSync,
 }
 
 impl RegistryKey {
     pub(crate) fn from_ref(reference: LuaRef) -> RegistryKey {
         RegistryKey {
             reference: XRc::new(reference),
-            _not_sync: NOT_SYNC,
         }
     }
 
@@ -60,7 +58,7 @@ impl std::fmt::Debug for RegistryKey {
 // it hashes/compares equal; keys for distinct values use distinct slots.
 impl PartialEq for RegistryKey {
     fn eq(&self, other: &Self) -> bool {
-        self.reference.state() == other.reference.state()
+        self.reference.state_ptr() == other.reference.state_ptr()
             && self.reference.id() == other.reference.id()
     }
 }
@@ -69,7 +67,7 @@ impl Eq for RegistryKey {}
 
 impl std::hash::Hash for RegistryKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (self.reference.state() as usize).hash(state);
+        (self.reference.state_ptr() as usize).hash(state);
         self.reference.id().hash(state);
     }
 }
@@ -79,6 +77,8 @@ impl Lua {
     /// alive. Mirrors `mlua::Lua::create_registry_value`.
     pub fn create_registry_value(&self, value: impl IntoLua) -> Result<RegistryKey> {
         let v = value.into_lua(self)?;
+        // Hold the VM lock across the push + pop_ref pair (see `StateRef`).
+        let _vm = self.state();
         self.push_value(&v)?;
         Ok(RegistryKey::from_ref(self.pop_ref()))
     }
@@ -90,6 +90,7 @@ impl Lua {
             return Err(Error::MismatchedRegistryKey);
         }
         let state = self.state();
+        let state = state.get();
         let value = unsafe {
             key.push();
             let v = self.value_from_stack(-1)?;
@@ -126,7 +127,7 @@ impl Lua {
         // Two `Lua` handles share the same VM iff their inner state pointers are
         // equal (cloning a `Lua` shares the `Rc<LuaInner>`; a separate
         // `Lua::new()` has a distinct state).
-        key.reference.state() == self.state()
+        key.reference.state_ptr() == self.state_ptr()
     }
 
     /// Expire any [`RegistryKey`]s whose strong handles have all been dropped.
@@ -142,6 +143,7 @@ impl Lua {
     pub fn set_named_registry_value(&self, name: &str, value: impl IntoLua) -> Result<()> {
         let v = value.into_lua(self)?;
         let state = self.state();
+        let state = state.get();
         let cname = std::ffi::CString::new(name)
             .map_err(|_| Error::runtime("registry name contains a NUL byte"))?;
         unsafe {
@@ -158,6 +160,7 @@ impl Lua {
     /// `mlua::Lua::named_registry_value`.
     pub fn named_registry_value<T: FromLua>(&self, name: &str) -> Result<T> {
         let state = self.state();
+        let state = state.get();
         let cname = std::ffi::CString::new(name)
             .map_err(|_| Error::runtime("registry name contains a NUL byte"))?;
         let value = unsafe {
@@ -189,10 +192,11 @@ impl IntoLua for RegistryKey {
 
 impl IntoLua for &RegistryKey {
     fn into_lua(self, lua: &Lua) -> Result<Value> {
-        if self.reference.state() != lua.state() {
+        if self.reference.state_ptr() != lua.state_ptr() {
             return Err(Error::MismatchedRegistryKey);
         }
         let state = lua.state();
+        let state = state.get();
         unsafe {
             self.push();
             let v = lua.value_from_stack(-1)?;

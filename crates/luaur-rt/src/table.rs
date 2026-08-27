@@ -2,7 +2,7 @@
 
 use crate::error::Result;
 use crate::state::{Lua, LuaRef};
-use crate::sync::{NotSync, XRc, NOT_SYNC};
+use crate::sync::XRc;
 use crate::sys::*;
 use crate::traits::{FromLua, IntoLua};
 use crate::value::Value;
@@ -11,19 +11,17 @@ use crate::value::Value;
 ///
 /// Mirrors `mlua::Table`. Holds a registry reference keeping the table alive.
 ///
-/// Under the `send` feature this handle is `Send` (the VM can be moved across
-/// threads) but never `Sync` — see [`crate::sync::NotSync`].
+/// Under the `send` feature this handle is `Send + Sync` (all VM access is
+/// serialized by the per-VM lock — see [`crate::state::StateRef`]).
 #[derive(Clone)]
 pub struct Table {
     pub(crate) reference: XRc<LuaRef>,
-    pub(crate) _not_sync: NotSync,
 }
 
 impl Table {
     pub(crate) fn from_ref(reference: LuaRef) -> Table {
         Table {
             reference: XRc::new(reference),
-            _not_sync: NOT_SYNC,
         }
     }
 
@@ -43,6 +41,7 @@ impl Table {
     pub fn set<K: IntoLua, V: IntoLua>(&self, key: K, value: V) -> Result<()> {
         let lua = self.lua();
         let state = lua.state();
+        let state = state.get();
         let k = key.into_lua(&lua)?;
         let v = value.into_lua(&lua)?;
         // Drive the (possibly metamethod-invoking) settable under pcall so a
@@ -67,6 +66,7 @@ impl Table {
     pub fn get<V: FromLua>(&self, key: impl IntoLua) -> Result<V> {
         let lua = self.lua();
         let state = lua.state();
+        let state = state.get();
         let k = key.into_lua(&lua)?;
         let value = unsafe {
             self.reference.push(); // table
@@ -96,6 +96,7 @@ impl Table {
     /// gives the same border-length semantics as `lua_rawlen`.
     pub fn raw_len(&self) -> usize {
         let state = self.reference.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             let n = lua_objlen(state, -1);
@@ -127,6 +128,7 @@ impl Table {
     /// `lua_next` probe — present iff the table has at least one key.
     pub fn is_empty(&self) -> bool {
         let state = self.reference.state();
+        let state = state.get();
         unsafe {
             self.reference.push(); // table
             lua_pushnil(state); // first key
@@ -202,6 +204,7 @@ impl Table {
     pub fn raw_set<K: IntoLua, V: IntoLua>(&self, key: K, value: V) -> Result<()> {
         let lua = self.lua();
         let state = lua.state();
+        let state = state.get();
         let k = key.into_lua(&lua)?;
         let v = value.into_lua(&lua)?;
         if self.is_readonly() {
@@ -225,6 +228,7 @@ impl Table {
     pub fn raw_get<V: FromLua>(&self, key: impl IntoLua) -> Result<V> {
         let lua = self.lua();
         let state = lua.state();
+        let state = state.get();
         let k = key.into_lua(&lua)?;
         let value = unsafe {
             self.reference.push(); // table
@@ -348,6 +352,7 @@ impl Table {
         // Collect every key (raw traversal), then nil them out.
         let lua = self.lua();
         let state = lua.state();
+        let state = state.get();
         let mut keys: Vec<Value> = Vec::new();
         unsafe {
             self.reference.push(); // table
@@ -372,6 +377,7 @@ impl Table {
     /// Mirrors `mlua::Table::to_pointer`.
     pub fn to_pointer(&self) -> *const std::ffi::c_void {
         let state = self.reference.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             let p = lua_topointer(state, -1);
@@ -385,6 +391,7 @@ impl Table {
     pub fn equals(&self, other: &Table) -> Result<bool> {
         let lua = self.lua();
         let state = lua.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             other.reference.push();
@@ -398,6 +405,7 @@ impl Table {
     pub fn metatable(&self) -> Option<Table> {
         let lua = self.lua();
         let state = lua.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             let has = lua_getmetatable(state, -1);
@@ -422,6 +430,7 @@ impl Table {
         }
         let lua = self.lua();
         let state = lua.state();
+        let state = state.get();
         unsafe {
             self.reference.push(); // table
             match metatable {
@@ -440,6 +449,7 @@ impl Table {
     /// `mlua::Table::is_readonly`.
     pub fn is_readonly(&self) -> bool {
         let state = self.reference.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             let ro = lua_getreadonly(state, -1);
@@ -452,6 +462,7 @@ impl Table {
     /// `mlua::Table::set_readonly`.
     pub fn set_readonly(&self, enabled: bool) {
         let state = self.reference.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             lua_setreadonly(state, -1, enabled as c_int);
@@ -557,6 +568,7 @@ impl<K: FromLua, V: FromLua> Iterator for TablePairs<K, V> {
         let key = self.next_key.take()?;
         let lua = self.table.lua();
         let state = lua.state();
+        let state = state.get();
         unsafe {
             self.table.reference.push(); // [.. table]
             if lua.push_value(&key).is_err() {
@@ -606,6 +618,7 @@ impl<K: FromLua, V: FromLua> Iterator for TablePairs<K, V> {
 /// Create a fresh empty table on `lua` and return a handle.
 pub(crate) fn create_table(lua: &Lua) -> Table {
     let state = lua.state();
+    let state = state.get();
     unsafe {
         lua_createtable(state, 0, 0);
         Table::from_ref(lua.pop_ref())

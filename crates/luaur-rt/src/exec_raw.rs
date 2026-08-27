@@ -76,6 +76,7 @@ impl Lua {
         F: FnOnce(*mut lua_State),
     {
         let state = self.state();
+        let state = state.get();
         let args: MultiValue = args.into_lua_multi(self)?;
         // Erase the closure's lifetime: it runs to completion before this
         // function returns (synchronous protected call), so the closure (and
@@ -158,6 +159,7 @@ impl Lua {
     /// results, return the result count). Mirrors mlua's `unsafe` contract.
     pub unsafe fn create_c_function(&self, func: lua_CFunction) -> Result<Function> {
         let state = self.state();
+        let state = state.get();
         unsafe {
             lua_pushcclosurek(state, func, c"luaur-rt-c-function".as_ptr(), 0, None);
             Ok(Function::from_ref(self.pop_ref()))

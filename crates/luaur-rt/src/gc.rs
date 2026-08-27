@@ -84,38 +84,39 @@ impl Lua {
     /// The number of bytes currently used by the VM. Mirrors
     /// `mlua::Lua::used_memory` (luaur's `totalbytes`).
     pub fn used_memory(&self) -> usize {
+        let state = self.state();
         unsafe {
-            let g = (*self.state()).global;
+            let g = (*state.get()).global;
             (*g).totalbytes
         }
     }
 
     /// Whether the GC is currently running. Mirrors `mlua::Lua::gc_is_running`.
     pub fn gc_is_running(&self) -> bool {
-        lua_gc(self.state(), lua_GCOp::LUA_GCISRUNNING as c_int, 0) != 0
+        lua_gc(self.state().get(), lua_GCOp::LUA_GCISRUNNING as c_int, 0) != 0
     }
 
     /// Stop the GC. Mirrors `mlua::Lua::gc_stop`.
     pub fn gc_stop(&self) {
-        lua_gc(self.state(), lua_GCOp::LUA_GCSTOP as c_int, 0);
+        lua_gc(self.state().get(), lua_GCOp::LUA_GCSTOP as c_int, 0);
     }
 
     /// Restart the GC. Mirrors `mlua::Lua::gc_restart`.
     pub fn gc_restart(&self) {
-        lua_gc(self.state(), lua_GCOp::LUA_GCRESTART as c_int, 0);
+        lua_gc(self.state().get(), lua_GCOp::LUA_GCRESTART as c_int, 0);
     }
 
     /// The total memory in use, in KB (the `LUA_GCCOUNT` op). Mirrors
     /// `mlua::Lua::gc_count`.
     pub fn gc_count(&self) -> usize {
-        let kb = lua_gc(self.state(), lua_GCOp::LUA_GCCOUNT as c_int, 0).max(0) as usize;
+        let kb = lua_gc(self.state().get(), lua_GCOp::LUA_GCCOUNT as c_int, 0).max(0) as usize;
         kb
     }
 
     /// Run one incremental GC step over `kbytes` of work. Returns whether a full
     /// collection cycle finished. Mirrors `mlua::Lua::gc_step_kbytes`/`gc_step`.
     pub fn gc_step_kbytes(&self, kbytes: c_int) -> Result<bool> {
-        let finished = lua_gc(self.state(), lua_GCOp::LUA_GCSTEP as c_int, kbytes) != 0;
+        let finished = lua_gc(self.state().get(), lua_GCOp::LUA_GCSTEP as c_int, kbytes) != 0;
         Ok(finished)
     }
 
@@ -129,6 +130,7 @@ impl Lua {
     /// incremental on Luau).
     pub fn gc_inc(&self, pause: c_int, step_multiplier: c_int, step_size: c_int) -> GcMode {
         let state = self.state();
+        let state = state.get();
         // mlua maps `pause` -> goal on the Luau backend.
         if pause > 0 {
             lua_gc(state, lua_GCOp::LUA_GCSETGOAL as c_int, pause);
@@ -151,6 +153,7 @@ impl Lua {
     /// returns the current incremental mode.
     pub fn gc_set_mode(&self, mode: GcMode) -> GcMode {
         let state = self.state();
+        let state = state.get();
         match mode {
             GcMode::Incremental(p) => {
                 if let Some(goal) = p.goal {

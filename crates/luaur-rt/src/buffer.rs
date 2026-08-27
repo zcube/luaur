@@ -14,7 +14,7 @@ use std::io;
 
 use crate::error::Result;
 use crate::state::{Lua, LuaRef};
-use crate::sync::{NotSync, XRc, NOT_SYNC};
+use crate::sync::XRc;
 use crate::sys::*;
 
 /// A Luau buffer type.
@@ -23,21 +23,19 @@ use crate::sys::*;
 ///
 /// Mirrors `mlua::Buffer`. Holds a registry reference keeping the buffer alive.
 ///
-/// Under the `send` feature it is `Send` but never `Sync` — see
-/// [`crate::sync::NotSync`].
+/// Under the `send` feature it is `Send + Sync` (all VM access is
+/// serialized by the per-VM lock — see [`crate::state::StateRef`]).
 ///
 /// [documentation]: https://luau.org/library#buffer-library
 #[derive(Clone)]
 pub struct Buffer {
     pub(crate) reference: XRc<LuaRef>,
-    pub(crate) _not_sync: NotSync,
 }
 
 impl Buffer {
     pub(crate) fn from_ref(reference: LuaRef) -> Buffer {
         Buffer {
             reference: XRc::new(reference),
-            _not_sync: NOT_SYNC,
         }
     }
 
@@ -111,6 +109,7 @@ impl Buffer {
     /// Mirrors `Value::Buffer(_).to_pointer()`.
     pub(crate) fn to_pointer(&self) -> *const std::ffi::c_void {
         let state = self.reference.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             let p = lua_topointer(state, -1);
@@ -141,6 +140,7 @@ impl Buffer {
     /// pointer remains valid because the registry ref keeps the object alive.
     unsafe fn as_raw_parts(&self) -> (*mut u8, usize) {
         let state = self.reference.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             let mut size = 0usize;
@@ -252,6 +252,7 @@ unsafe fn c_newbuffer(state: *mut lua_State) -> c_int {
 /// allocation as an `Err` rather than letting the VM longjmp.
 pub(crate) fn create_buffer_with_capacity(lua: &Lua, size: usize) -> Result<Buffer> {
     let state = lua.state();
+    let state = state.get();
     unsafe {
         lua_pushcclosurek(
             state,

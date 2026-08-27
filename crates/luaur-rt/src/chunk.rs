@@ -127,6 +127,7 @@ impl Chunk {
     pub fn into_function(self) -> Result<Function> {
         let bytecode = self.compile()?;
         let state = self.lua.state();
+        let state = state.get();
         unsafe {
             let chunkname = std::ffi::CString::new(format!("={}", self.name))
                 .unwrap_or_else(|_| std::ffi::CString::new("=chunk").unwrap());
