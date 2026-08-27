@@ -30,6 +30,25 @@ mod attr;
 mod from_lua;
 mod userdata;
 
+/// The path to the luaur-rt crate **as the deriving crate names it**.
+///
+/// `#[derive]` output must name luaur-rt items with an absolute path, but the
+/// user may have renamed the dependency (`mlua = { package = "luaur-rt", .. }`
+/// is the supported mlua-drop-in shape). Resolve the real name from the user's
+/// Cargo.toml; fall back to `::luaur_rt` when resolution is unavailable (e.g.
+/// building outside cargo).
+pub(crate) fn runtime_path() -> proc_macro2::TokenStream {
+    use proc_macro_crate::{crate_name, FoundCrate};
+    match crate_name("luaur-rt") {
+        Ok(FoundCrate::Itself) => quote::quote!(::luaur_rt),
+        Ok(FoundCrate::Name(name)) => {
+            let ident = proc_macro2::Ident::new(&name, proc_macro2::Span::call_site());
+            quote::quote!(::#ident)
+        }
+        Err(_) => quote::quote!(::luaur_rt),
+    }
+}
+
 /// Derive macro implementing `UserData` for a struct, exposing its named fields
 /// to Lua.
 ///

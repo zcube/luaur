@@ -16,6 +16,7 @@ members = [
     "crates/luaur-compiler",
     "crates/luaur-config",
     "crates/luaur-conformance",
+    "crates/luaur-mlua-compat-test",
     "crates/luaur-e2e",
     "crates/luaur-reduce-cli",
     "crates/luaur-repl-cli",

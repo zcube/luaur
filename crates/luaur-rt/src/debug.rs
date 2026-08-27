@@ -85,9 +85,20 @@ impl Debug {
 
 impl Lua {
     /// Inspect the activation record `level` frames up the call stack (0 = the
-    /// currently running function). Returns `None` if there is no function at
-    /// that level. Mirrors the Luau-feasible part of `mlua::Lua::inspect_stack`.
-    pub fn inspect_stack(&self, level: usize) -> Option<Debug> {
+    /// currently running function), passing it to `f`. Returns `None` if there
+    /// is no function at that level, otherwise `Some(f(&debug))`.
+    ///
+    /// Mirrors the Luau-feasible part of `mlua::Lua::inspect_stack` —
+    /// including its mlua-0.10+ closure shape, so mlua code calling
+    /// `lua.inspect_stack(1, |debug| ..)` ports verbatim. (In mlua the closure
+    /// bounds the activation record's lifetime; luaur's `Debug` snapshot is
+    /// owned, but the signature is kept identical for drop-in compatibility.)
+    pub fn inspect_stack<R>(&self, level: usize, f: impl FnOnce(&Debug) -> R) -> Option<R> {
+        self.inspect_stack_raw(level).map(|d| f(&d))
+    }
+
+    /// The record-returning form behind [`Lua::inspect_stack`].
+    fn inspect_stack_raw(&self, level: usize) -> Option<Debug> {
         let state = self.state();
         let state = state.get();
         unsafe {

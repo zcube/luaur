@@ -36,7 +36,7 @@ fn test_debug_format_deferred() -> Result<()> {
 
 #[test]
 fn test_inspect_stack() -> Result<()> {
-    // `Lua::inspect_stack(level)` resolves an activation record via `lua_getinfo`.
+    // `Lua::inspect_stack(level, f)` resolves an activation record via `lua_getinfo`.
     // From within a Rust callback, level 0 is the callback (a C/native function)
     // and level 1 is its Lua caller (the chunk).
     let lua = Lua::new();
@@ -45,8 +45,9 @@ fn test_inspect_stack() -> Result<()> {
     let cap2 = captured.clone();
     let probe = lua.create_function(move |lua, ()| {
         // The immediate caller (level 1) is the loaded chunk: a Lua/main frame.
-        let caller = lua.inspect_stack(1);
-        *cap2.lock().unwrap() = caller.map(|d| (d.what(), d.current_line()));
+        // mlua-0.10+ closure form: `inspect_stack(level, f) -> Option<R>`.
+        let caller = lua.inspect_stack(1, |d| (d.what(), d.current_line()));
+        *cap2.lock().unwrap() = caller;
         Ok(())
     })?;
     lua.globals().set("probe", probe)?;
@@ -83,7 +84,7 @@ fn test_inspect_stack_self() -> Result<()> {
     let what = Arc::new(Mutex::new(None));
     let what2 = what.clone();
     let probe = lua.create_function(move |lua, ()| {
-        *what2.lock().unwrap() = lua.inspect_stack(0).map(|d| d.what());
+        *what2.lock().unwrap() = lua.inspect_stack(0, |d| d.what());
         Ok(())
     })?;
     probe.call::<()>(())?;

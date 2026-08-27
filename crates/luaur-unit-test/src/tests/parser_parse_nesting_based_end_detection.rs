@@ -31,12 +31,11 @@ end
     );
 
     luaur_common::LUAU_ASSERT!(result.errors.len() == 1);
-    let msg = unsafe {
-        core::ffi::CStr::from_ptr(
-            result.errors[0].get_message().as_ptr() as *const core::ffi::c_char
-        )
-    }
-    .to_string_lossy();
+    // `get_message()` is a plain Rust `String` — NOT NUL-terminated. The old
+    // `CStr::from_ptr(msg.as_ptr())` read past its end until it happened upon
+    // a 0 byte, nondeterministically appending heap garbage (seen as a
+    // "...?\Temp" suffix on Windows CI). Compare the string directly.
+    let msg = result.errors[0].get_message();
     let expected_msg = "Expected 'end' (to close 'function' at line 2), got <eof>; did you forget to close 'else' at line 8?" ;
-    assert_eq!(&*msg, expected_msg);
+    assert_eq!(msg, expected_msg);
 }

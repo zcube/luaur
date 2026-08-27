@@ -29,7 +29,7 @@
 //   - `test_c_function`  -> luaur's `lua_CFunction` is a pure-Rust
 //     `unsafe fn(*mut lua_State) -> c_int` (no C ABI), not mlua's
 //     `extern "C-unwind" fn`; the deferred pin uses the luaur-native shape.
-//   - `test_inspect_stack` -> luaur-rt's `inspect_stack(level) -> Option<Debug>`
+//   - `test_inspect_stack` -> luaur-rt's `inspect_stack(level, f) -> Option<R>`
 //     has a different (non-closure) shape and the `Debug` record exposes a
 //     smaller field set than mlua's (no `stack()`/`function()`); a reduced
 //     equivalent is asserted.
@@ -382,28 +382,28 @@ fn test_num_conversion() -> Result<()> {
     let lua = Lua::new();
 
     assert_eq!(
-        lua.coerce_integer(Value::String(lua.create_string("1")))?,
+        lua.coerce_integer(Value::String(lua.create_string("1")?))?,
         Some(1)
     );
     assert_eq!(
-        lua.coerce_integer(Value::String(lua.create_string("1.0")))?,
+        lua.coerce_integer(Value::String(lua.create_string("1.0")?))?,
         Some(1)
     );
     assert_eq!(
-        lua.coerce_integer(Value::String(lua.create_string("1.5")))?,
+        lua.coerce_integer(Value::String(lua.create_string("1.5")?))?,
         None
     );
 
     assert_eq!(
-        lua.coerce_number(Value::String(lua.create_string("1")))?,
+        lua.coerce_number(Value::String(lua.create_string("1")?))?,
         Some(1.0)
     );
     assert_eq!(
-        lua.coerce_number(Value::String(lua.create_string("1.0")))?,
+        lua.coerce_number(Value::String(lua.create_string("1.0")?))?,
         Some(1.0)
     );
     assert_eq!(
-        lua.coerce_number(Value::String(lua.create_string("1.5")))?,
+        lua.coerce_number(Value::String(lua.create_string("1.5")?))?,
         Some(1.5)
     );
 
@@ -1246,16 +1246,15 @@ fn test_inspect_stack_deferred() -> Result<()> {
     // DEFERRED / DEVIATION: mlua's `test_inspect_stack` uses
     // `lua.inspect_stack(level, |debug| ...)` (a closure) and reads
     // `debug.source().short_src`, `debug.current_line()`, `debug.stack()`, and
-    // `debug.function()`. luaur-rt's `inspect_stack(level) -> Option<Debug>` has
-    // no closure form and the `Debug` record exposes a smaller field set (no
-    // `stack()`/`function()`). We pin the subset luaur-rt backs: resolving a
-    // running callback's frame to a source + current line.
+    // `debug.function()`. luaur-rt's `inspect_stack(level, f)` now matches
+    // mlua's closure form, but the `Debug` record exposes a smaller field set
+    // (no `stack()`/`function()`). We pin the subset luaur-rt backs: resolving
+    // a running callback's frame to a source + current line.
     let lua = Lua::new();
 
     let logline = lua.create_function(|lua, msg: String| {
         let r = lua
-            .inspect_stack(1)
-            .map(|debug| {
+            .inspect_stack(1, |debug| {
                 let source = debug.short_src().unwrap_or("?").to_string();
                 let line = debug.current_line().unwrap_or(-1);
                 format!("{}:{} {}", source, line, msg)

@@ -27,9 +27,9 @@
   internal `luaur-*` path-dep requirement together (they are all `version = "X"` strings in the
   `Cargo.toml`s), then refresh `Cargo.lock`.
 - **Publishing to crates.io is irreversible — confirm the version with the user before publishing.**
-  Publish in dependency order; `cargo publish --workspace` handles ordering + index waiting. The 4
-  `publish = false` crates (`luaur-cli-test`, `luaur-unit-test`, `luaur-conformance`, `luaur-e2e`) and
-  the `examples/*` are skipped automatically; 20 crates publish.
+  Publish in dependency order; `cargo publish --workspace` handles ordering + index waiting. The 5
+  `publish = false` crates (`luaur-cli-test`, `luaur-unit-test`, `luaur-conformance`, `luaur-e2e`,
+  `luaur-mlua-compat-test`) and the `examples/*` are skipped automatically; 20 crates publish.
 
 ## Commit / PR hygiene
 

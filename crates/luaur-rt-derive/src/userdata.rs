@@ -139,9 +139,11 @@ pub fn userdata_type(item: TokenStream) -> TokenStream {
         }
     }
 
+    let rt = crate::runtime_path();
+
     let output = quote! {
-        impl ::luaur_rt::UserData for #type_name {
-            fn add_fields<__LuaurUDF: ::luaur_rt::UserDataFields<Self>>(fields: &mut __LuaurUDF) {
+        impl #rt::UserData for #type_name {
+            fn add_fields<__LuaurUDF: #rt::UserDataFields<Self>>(fields: &mut __LuaurUDF) {
                 #(#field_registrations)*
             }
         }

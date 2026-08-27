@@ -38,7 +38,7 @@ fn test_string_into_lua() -> Result<()> {
     let lua = Lua::new();
 
     // Direct conversion
-    let s = lua.create_string("hello, world!");
+    let s = lua.create_string("hello, world!")?;
     let s2 = s.clone().into_lua(&lua)?;
     assert_eq!(s, *s2.as_string().unwrap());
 
@@ -203,7 +203,7 @@ fn test_registry_value_into_lua() -> Result<()> {
     let lua = Lua::new();
 
     // Direct conversion
-    let s = lua.create_string("hello, world");
+    let s = lua.create_string("hello, world")?;
     let r = lua.create_registry_value(&s)?;
     let value1 = lua.pack(&r)?;
     let value2 = lua.pack(r)?;
@@ -476,7 +476,7 @@ fn test_char_from_lua() -> Result<()> {
     let lua = Lua::new();
 
     assert_eq!(
-        char::from_lua(lua.create_string("A").into_lua(&lua)?, &lua)?,
+        char::from_lua(lua.create_string("A")?.into_lua(&lua)?, &lua)?,
         'A'
     );
     assert_eq!(char::from_lua(Value::Integer(65), &lua)?, 'A');
@@ -484,7 +484,7 @@ fn test_char_from_lua() -> Result<()> {
     assert!(char::from_lua(Value::Integer(5456324), &lua)
         .is_err_and(|e| e.to_string().contains("out of range")));
     assert!(
-        char::from_lua(lua.create_string("hello").into_lua(&lua)?, &lua)
+        char::from_lua(lua.create_string("hello")?.into_lua(&lua)?, &lua)
             .is_err_and(|e| e.to_string().contains("exactly one char"))
     );
     assert!(char::from_lua(Value::Table(lua.create_table()), &lua)

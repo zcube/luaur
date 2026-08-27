@@ -85,6 +85,41 @@ pub trait UserDataMethods<T> {
         M: Fn(&Lua, &mut T, A) -> Result<R> + MaybeSend + 'static,
         A: FromLuaMulti,
         R: IntoLuaMulti;
+
+    /// Register a meta-method as a plain function: unlike
+    /// [`add_meta_method`](UserDataMethods::add_meta_method), the receiver is
+    /// **not** split off — the closure gets *every* argument (receiver
+    /// included) through `A`'s [`FromLuaMulti`] conversion.
+    ///
+    /// Mirrors `mlua::UserDataMethods::add_meta_function`. This is the right
+    /// shape for binary metamethods (`__add`, `__sub`, `__eq`, ...), where Lua
+    /// may pass the userdata as *either* operand (`ud - 5` vs `5 - ud`), and
+    /// for `__index`/`__newindex` handlers that want the raw receiver value.
+    fn add_meta_function<F, A, R>(&mut self, name: impl Into<String>, function: F)
+    where
+        F: Fn(&Lua, A) -> Result<R> + MaybeSend + 'static,
+        A: FromLuaMulti,
+        R: IntoLuaMulti;
+
+    /// Register a meta-method as a plain **mutable** function. Like
+    /// [`add_meta_function`](UserDataMethods::add_meta_function) but takes
+    /// `FnMut`; a re-entrant call surfaces as
+    /// [`Error::RecursiveMutCallback`](crate::Error::RecursiveMutCallback).
+    /// Mirrors `mlua::UserDataMethods::add_meta_function_mut`.
+    fn add_meta_function_mut<F, A, R>(&mut self, name: impl Into<String>, function: F)
+    where
+        F: FnMut(&Lua, A) -> Result<R> + MaybeSend + 'static,
+        A: FromLuaMulti,
+        R: IntoLuaMulti,
+    {
+        let function = std::cell::RefCell::new(function);
+        self.add_meta_function(name, move |lua, args: A| {
+            let mut borrow = function
+                .try_borrow_mut()
+                .map_err(|_| Error::RecursiveMutCallback)?;
+            (borrow)(lua, args)
+        });
+    }
 }
 
 /// Registrar passed to [`UserData::add_fields`].
@@ -588,6 +623,25 @@ impl<T: 'static> UserDataMethods<T> for Collector<T> {
             callback,
         });
     }
+    fn add_meta_function<F, A, R>(&mut self, name: impl Into<String>, function: F)
+    where
+        F: Fn(&Lua, A) -> Result<R> + MaybeSend + 'static,
+        A: FromLuaMulti,
+        R: IntoLuaMulti,
+    {
+        // Same erasure as `add_function`, but installed on the metatable: no
+        // receiver split — all arguments pass through to `A` unchanged.
+        let callback: BoxedCallback = Box::new(move |lua, args| {
+            let a = A::from_lua_multi(args, lua)?;
+            let r = function(lua, a)?;
+            r.into_lua_multi(lua)
+        });
+        self.methods.push(Registered {
+            name: name.into(),
+            is_meta: true,
+            callback,
+        });
+    }
 }
 
 impl<T: 'static> UserDataFields<T> for Collector<T> {
@@ -922,6 +976,25 @@ impl<T> UserDataMethods<T> for ScopedCollector<T> {
                 .map_err(|_| Error::UserDataBorrowMutError)?;
             let data = borrowed.as_mut().ok_or(Error::UserDataDestructed)?;
             let r = method(lua, data, a)?;
+            r.into_lua_multi(lua)
+        });
+        self.methods.push(Registered {
+            name: name.into(),
+            is_meta: true,
+            callback,
+        });
+    }
+    fn add_meta_function<F, A, R>(&mut self, name: impl Into<String>, function: F)
+    where
+        F: Fn(&Lua, A) -> Result<R> + MaybeSend + 'static,
+        A: FromLuaMulti,
+        R: IntoLuaMulti,
+    {
+        // Same erasure as `add_function`, but installed on the metatable: no
+        // receiver split — all arguments pass through to `A` unchanged.
+        let callback: BoxedCallback = Box::new(move |lua, args| {
+            let a = A::from_lua_multi(args, lua)?;
+            let r = function(lua, a)?;
             r.into_lua_multi(lua)
         });
         self.methods.push(Registered {

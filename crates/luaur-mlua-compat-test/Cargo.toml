@@ -1,0 +1,30 @@
+[package]
+name = "luaur-mlua-compat-test"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+publish = false
+
+# The mlua-drop-in shape this crate exists to pin: an embedder (e.g. the
+# bevy_mod_scripting Lua layer) swaps mlua for luaur-rt with nothing but this
+# dependency rename — `use mlua::…` in its source then resolves to luaur-rt.
+# Everything in tests/ is written against the `mlua` name to prove the swap
+# needs no source changes (derive macros included, which must resolve the
+# renamed crate path themselves).
+[dependencies]
+mlua = { package = "luaur-rt", path = "../luaur-rt", version = "0.1.8", features = [
+    "serde",
+    "macros",
+] }
+
+[features]
+# The embedder shape also turns on `send` (BMS uses send+serde+macros). Kept
+# behind a feature here — NOT default — because cargo unifies features across a
+# workspace build, and `send` is the one flag that changes bounds workspace-wide
+# (e.g. examples capturing `Rc` in callbacks). CI runs this crate with `send`
+# in the luaur-rt feature-matrix step.
+send = ["mlua/send"]
+
+[lib]
+# Tests only.
+path = "src/lib.rs"

@@ -87,6 +87,7 @@ jobs:
           cargo nextest run -p luaur-rt --locked --features send,typecheck
           cargo nextest run -p luaur-rt --locked --features send,async,serde,macros,typecheck
           cargo nextest run -p luaur --locked --features checked-macros
+          cargo nextest run -p luaur-mlua-compat-test --locked --features send
 
       - name: Doctests (luaur + luaur-rt)
         if: runner.os == 'Linux'
