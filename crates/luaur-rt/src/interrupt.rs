@@ -7,9 +7,10 @@
 //!
 //! luaur's `lua_callbacks().interrupt` is a plain C function pointer, so we
 //! install a fixed trampoline ([`interrupt_trampoline`]) and keep the Rust
-//! closure in a thread-local keyed by the VM's *global* pointer (shared by all
-//! threads of one `Lua`). The trampoline looks up the closure, runs it with a
-//! borrowed [`Lua`], and:
+//! closure in a per-VM store keyed by the VM's *global* pointer (shared by all
+//! threads of one `Lua`) — thread-local without the `send` feature, a
+//! process-global `RwLock` map with it (the VM may then run on any thread).
+//! The trampoline looks up the closure, runs it with a borrowed [`Lua`], and:
 //!
 //! * `Ok(VmState::Continue)`  — returns normally; the VM keeps executing.
 //! * `Ok(VmState::Yield)`     — calls `lua_break`, which sets the running
@@ -17,11 +18,9 @@
 //!   yieldable point; ignored otherwise, exactly like upstream Luau).
 //! * `Err(e)`                 — raises `e` as a Lua error via `lua_error`.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-
 use crate::error::{Error, Result};
 use crate::state::Lua;
+use crate::sync::XRc;
 use crate::sys::*;
 
 /// The action an interrupt callback asks the VM to take. Mirrors
@@ -34,19 +33,77 @@ pub enum VmState {
     Yield,
 }
 
+/// The type-erased interrupt closure. `Send` under the `send` feature: the VM
+/// (and hence the safepoint that invokes the closure) may run on any thread.
+#[cfg(feature = "send")]
+type InterruptFn = Box<dyn Fn(&Lua) -> Result<VmState> + Send + 'static>;
+/// See the `send`-gated variant above.
+#[cfg(not(feature = "send"))]
 type InterruptFn = Box<dyn Fn(&Lua) -> Result<VmState> + 'static>;
 
-thread_local! {
-    /// Per-VM interrupt closure, keyed by the `global_State` pointer (stable for
-    /// the lifetime of the VM and shared by all of its threads).
-    static INTERRUPTS: RefCell<HashMap<*mut core::ffi::c_void, InterruptFn>> =
-        RefCell::new(HashMap::new());
+/// The closure's shared slot. The trampoline clones the `XRc` out of the store
+/// (read lock only) and invokes the clone, so a re-entrant `set_interrupt` /
+/// `remove_interrupt` from inside the callback simply replaces the map entry —
+/// no aliasing, no take-out/put-back dance.
+struct InterruptSlot(InterruptFn);
+
+// SAFETY (`send` only): the closure is only ever *invoked* from a VM safepoint,
+// i.e. on a thread that is currently executing this VM and therefore holds the
+// per-VM re-entrant lock; installs also run under that lock (`set_interrupt`
+// takes `self.state()`). Invocations of one slot are thus serialized even
+// though the `Arc` itself may be cloned/dropped on any thread, so sharing
+// `&InterruptSlot` across threads never yields a concurrent call.
+#[cfg(feature = "send")]
+unsafe impl Sync for InterruptSlot {}
+
+#[cfg(not(feature = "send"))]
+mod interrupt_store {
+    use super::{InterruptSlot, XRc};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        /// Per-VM interrupt closure, keyed by the `global_State` pointer
+        /// (stable for the lifetime of the VM, shared by all of its threads).
+        static INTERRUPTS: RefCell<HashMap<usize, XRc<InterruptSlot>>> =
+            RefCell::new(HashMap::new());
+    }
+
+    pub(super) fn read<R>(f: impl FnOnce(&HashMap<usize, XRc<InterruptSlot>>) -> R) -> R {
+        INTERRUPTS.with(|m| f(&m.borrow()))
+    }
+
+    pub(super) fn write<R>(f: impl FnOnce(&mut HashMap<usize, XRc<InterruptSlot>>) -> R) -> R {
+        INTERRUPTS.with(|m| f(&mut m.borrow_mut()))
+    }
+}
+
+#[cfg(feature = "send")]
+mod interrupt_store {
+    //! Under `send` the VM can run on any thread, so the closure must live in
+    //! a process-global map. `RwLock`: the safepoint hot path only reads.
+    use super::{InterruptSlot, XRc};
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, RwLock};
+
+    static INTERRUPTS: LazyLock<RwLock<HashMap<usize, XRc<InterruptSlot>>>> =
+        LazyLock::new(|| RwLock::new(HashMap::new()));
+
+    pub(super) fn read<R>(f: impl FnOnce(&HashMap<usize, XRc<InterruptSlot>>) -> R) -> R {
+        let guard = INTERRUPTS.read().unwrap_or_else(|e| e.into_inner());
+        f(&guard)
+    }
+
+    pub(super) fn write<R>(f: impl FnOnce(&mut HashMap<usize, XRc<InterruptSlot>>) -> R) -> R {
+        let mut guard = INTERRUPTS.write().unwrap_or_else(|e| e.into_inner());
+        f(&mut guard)
+    }
 }
 
 /// The `global_State` pointer for `state` — the per-VM key shared by all
 /// threads of one `Lua`.
-unsafe fn vm_key(state: *mut lua_State) -> *mut core::ffi::c_void {
-    unsafe { (*state).global as *mut core::ffi::c_void }
+unsafe fn vm_key(state: *mut lua_State) -> usize {
+    unsafe { (*state).global as usize }
 }
 
 impl Lua {
@@ -59,10 +116,11 @@ impl Lua {
         F: Fn(&Lua) -> Result<VmState> + crate::sync::MaybeSend + 'static,
     {
         let state = self.state();
+        let state = state.get();
         unsafe {
             let key = vm_key(state);
-            INTERRUPTS.with(|m| {
-                m.borrow_mut().insert(key, Box::new(callback));
+            interrupt_store::write(|m| {
+                m.insert(key, XRc::new(InterruptSlot(Box::new(callback))));
             });
             let cb = lua_callbacks(state);
             (*cb).interrupt = Some(interrupt_trampoline);
@@ -73,10 +131,11 @@ impl Lua {
     /// `mlua::Lua::remove_interrupt`.
     pub fn remove_interrupt(&self) {
         let state = self.state();
+        let state = state.get();
         unsafe {
             let key = vm_key(state);
-            INTERRUPTS.with(|m| {
-                m.borrow_mut().remove(&key);
+            interrupt_store::write(|m| {
+                m.remove(&key);
             });
             let cb = lua_callbacks(state);
             (*cb).interrupt = None;
@@ -90,8 +149,8 @@ impl Lua {
 /// the VM and this never runs — but the common case captures non-Lua state.)
 pub(crate) fn clear_interrupt(state: *mut lua_State) {
     let key = unsafe { vm_key(state) };
-    INTERRUPTS.with(|m| {
-        m.borrow_mut().remove(&key);
+    interrupt_store::write(|m| {
+        m.remove(&key);
     });
 }
 
@@ -106,20 +165,14 @@ unsafe extern "C-unwind" fn interrupt_trampoline(state: *mut lua_State, gc: c_in
         return;
     }
     let key = unsafe { vm_key(state) };
-    // Take the closure out of the map for the duration of the call so a
-    // re-entrant `set_interrupt` from inside the callback can't alias the
-    // borrow. Put it back afterwards (unless the callback replaced it).
-    let cb = INTERRUPTS.with(|m| m.borrow_mut().remove(&key));
+    // Clone the slot out (read lock only) and invoke the clone: a re-entrant
+    // `set_interrupt` inside the callback replaces the map entry without
+    // touching this invocation.
+    let cb = interrupt_store::read(|m| m.get(&key).cloned());
     let Some(cb) = cb else { return };
 
     let lua = unsafe { Lua::from_borrowed(state) };
-    let result = cb(&lua);
-
-    // Restore the closure if the callback didn't install a new one.
-    INTERRUPTS.with(|m| {
-        let mut map = m.borrow_mut();
-        map.entry(key).or_insert(cb);
-    });
+    let result = (cb.0)(&lua);
 
     match result {
         Ok(VmState::Continue) => {}
@@ -162,5 +215,5 @@ unsafe fn raise_error(state: *mut lua_State, e: &Error) -> ! {
 
 #[cfg(test)]
 pub(crate) fn interrupts_len() -> usize {
-    INTERRUPTS.with(|m| m.borrow().len())
+    interrupt_store::read(|m| m.len())
 }

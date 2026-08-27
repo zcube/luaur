@@ -540,6 +540,7 @@ unsafe fn push_c_closure_with_upvalue(
 /// [`Lua::create_async_function`].
 pub(crate) fn create_async_callback(lua: &Lua, callback: AsyncCallback) -> Result<Function> {
     let state = lua.state();
+    let state = state.get();
 
     // 1. Build the `get_future` C closure with the callback as its upvalue.
     let get_future = unsafe {
@@ -624,6 +625,7 @@ impl Lua {
                     // `poll_c` recognises a value-carrying yield, then report Pending.
                     Some(values) => {
                         let state = lua.state();
+                        let state = state.get();
                         unsafe {
                             lua_pushlightuserdatatagged(state, poll_yield(), 0);
                             let count = values.len() as c_int;
@@ -658,6 +660,7 @@ impl Lua {
                     // *not* a result and must be left in place for `poll_c`.
                     None => {
                         let state = lua.state();
+                        let state = state.get();
                         let result = unsafe {
                             let top = lua_gettop(state);
                             // `value_from_stack` duplicates each reference result
@@ -874,7 +877,7 @@ impl<R: FromLuaMulti> Future for AsyncThread<R> {
             return Poll::Ready(Err(Error::CoroutineUnresumable));
         }
         let lua = this.thread.lua();
-        let _wg = set_current_waker(lua.state(), cx.waker().clone());
+        let _wg = set_current_waker(lua.state().get(), cx.waker().clone());
 
         let args = this.take_args();
         match this.thread.resume_for_async(args) {
@@ -909,7 +912,7 @@ impl<R: FromLuaMulti> futures_util::stream::Stream for AsyncThread<R> {
             return Poll::Ready(None);
         }
         let lua = this.thread.lua();
-        let _wg = set_current_waker(lua.state(), cx.waker().clone());
+        let _wg = set_current_waker(lua.state().get(), cx.waker().clone());
 
         let args = this.take_args();
         match this.thread.resume_for_async(args) {

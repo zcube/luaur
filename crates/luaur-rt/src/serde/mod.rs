@@ -21,9 +21,6 @@
 //!   recognizes this exact table by pointer identity and treats it as
 //!   `null`/`None`, reproducing mlua's behavior at the API level.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-
 use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
 
@@ -76,17 +73,24 @@ struct SentinelPtrs {
     array_metatable: *const core::ffi::c_void,
 }
 
-thread_local! {
-    static SENTINELS: RefCell<HashMap<*mut lua_State, SentinelPtrs>> =
-        RefCell::new(HashMap::new());
-}
+// SAFETY (`send` only): the pointers are opaque identity tokens — compared,
+// never dereferenced — so sharing them across threads is trivially sound.
+#[cfg(feature = "send")]
+unsafe impl Send for SentinelPtrs {}
+#[cfg(feature = "send")]
+unsafe impl Sync for SentinelPtrs {}
+
+crate::sync::vm_state_map!(
+    /// Cached sentinel-table pointers, keyed by the owning state pointer.
+    sentinels: SentinelPtrs
+);
 
 /// Ensure both sentinel tables exist for `lua`: create them, root them in the
 /// registry (so they outlive the local handles without pinning the VM), and
 /// cache their pointers. Idempotent.
 fn ensure_sentinels(lua: &Lua) {
-    let key = lua.state();
-    if SENTINELS.with(|c| c.borrow().contains_key(&key)) {
+    let key = lua.state_ptr() as usize;
+    if sentinels::read(|c| c.contains_key(&key)) {
         return;
     }
     let null = lua.create_table();
@@ -99,8 +103,8 @@ fn ensure_sentinels(lua: &Lua) {
     // thread-local keeps only their pointers.
     let _ = lua.set_named_registry_value(NULL_REGISTRY_NAME, null);
     let _ = lua.set_named_registry_value(ARRAY_MT_REGISTRY_NAME, array_metatable);
-    SENTINELS.with(|c| {
-        c.borrow_mut().insert(key, ptrs);
+    sentinels::write(|c| {
+        c.insert(key, ptrs);
     });
 }
 
@@ -135,10 +139,9 @@ fn build_array_metatable(lua: &Lua) -> Table {
 /// table pointer identity).
 pub(crate) fn is_null(value: &Value) -> bool {
     if let Value::Table(t) = value {
-        let key = t.lua().state();
-        return SENTINELS.with(|cell| {
-            cell.borrow()
-                .get(&key)
+        let key = t.lua().state_ptr() as usize;
+        return sentinels::read(|cell| {
+            cell.get(&key)
                 .map(|s| s.null == t.to_pointer())
                 .unwrap_or(false)
         });
@@ -148,8 +151,8 @@ pub(crate) fn is_null(value: &Value) -> bool {
 
 /// Whether `table` carries the array metatable (compared by pointer identity).
 pub(crate) fn has_array_metatable(table: &Table) -> bool {
-    let key = table.lua().state();
-    let array_ptr = SENTINELS.with(|cell| cell.borrow().get(&key).map(|s| s.array_metatable));
+    let key = table.lua().state_ptr() as usize;
+    let array_ptr = sentinels::read(|cell| cell.get(&key).map(|s| s.array_metatable));
     match array_ptr {
         Some(ptr) => table
             .metatable()
@@ -165,9 +168,12 @@ pub(crate) fn has_array_metatable(table: &Table) -> bool {
 pub(crate) fn clear_sentinels(state: *mut lua_State) {
     // `Lua` can itself be stored in TLS. During thread teardown this drop may
     // run after the serde sentinel TLS has started destruction, in which case
-    // the map is already going away and there is nothing left to evict.
-    let _ = SENTINELS.try_with(|c| {
-        c.borrow_mut().remove(&state);
+    // the map is already going away and there is nothing left to evict
+    // (`try_write` is a plain write on the `send` backend, whose global static
+    // never tears down).
+    let key = state as usize;
+    sentinels::try_write(|c| {
+        c.remove(&key);
     });
 }
 
@@ -245,5 +251,5 @@ impl LuaSerdeExt for Lua {
 
 #[cfg(test)]
 pub(crate) fn sentinels_len() -> usize {
-    SENTINELS.with(|m| m.borrow().len())
+    sentinels::read(|m| m.len())
 }

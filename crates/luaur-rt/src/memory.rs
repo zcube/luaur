@@ -21,7 +21,6 @@
 //! name→id table (max 255 user categories: id 0 is reserved for `"main"`),
 //! validate names (`[A-Za-z0-9_]+`), and call `lua_setmemcat`.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
@@ -46,25 +45,34 @@ struct MemoryControl {
     base_ud: *mut core::ffi::c_void,
 }
 
-thread_local! {
+// SAFETY (`send` only): `MemoryControl` holds raw pointers into the VM's
+// global state and its base allocator. It is only ever read/written while the
+// per-VM re-entrant lock is held (the allocator runs inside VM operations; the
+// public API functions lock via `self.state()`), so sharing the box across
+// threads through the store below cannot race.
+#[cfg(feature = "send")]
+unsafe impl Send for MemoryControl {}
+#[cfg(feature = "send")]
+unsafe impl Sync for MemoryControl {}
+
+crate::sync::vm_state_map!(
     /// One `MemoryControl` per VM, keyed by the global-state pointer. Boxed so
     /// its address (handed to the VM as `ud`) is stable.
-    static MEMORY_CONTROLS: RefCell<HashMap<*mut core::ffi::c_void, Box<MemoryControl>>> =
-        RefCell::new(HashMap::new());
-
+    memory_controls: Box<MemoryControl>
+);
+crate::sync::vm_state_map!(
     /// Per-VM memory-category name→id table (id 0 is reserved for `"main"`).
-    static MEMORY_CATEGORIES: RefCell<HashMap<*mut core::ffi::c_void, HashMap<String, u8>>> =
-        RefCell::new(HashMap::new());
-}
+    memory_categories: HashMap<String, u8>
+);
 
 /// The global-state pointer for `state` — the per-VM key.
-unsafe fn global_key(state: *mut lua_State) -> *mut core::ffi::c_void {
-    unsafe { (*state).global as *mut core::ffi::c_void }
+unsafe fn global_key(state: *mut lua_State) -> usize {
+    unsafe { (*state).global as usize }
 }
 
 /// The global-state pointer for `state`, exposed for `LuaInner::drop` to capture
 /// the memory-map key BEFORE `lua_close` frees the state.
-pub(crate) unsafe fn memory_key(state: *mut lua_State) -> *mut core::ffi::c_void {
+pub(crate) unsafe fn memory_key(state: *mut lua_State) -> usize {
     unsafe { global_key(state) }
 }
 
@@ -74,12 +82,12 @@ pub(crate) unsafe fn memory_key(state: *mut lua_State) -> *mut core::ffi::c_void
 /// stay live for the entire close (which frees every object through it), so this
 /// takes `key` — the global-state pointer captured *before* close, since the
 /// state is freed by the time this runs.
-pub(crate) fn clear_memory(key: *mut core::ffi::c_void) {
-    MEMORY_CONTROLS.with(|m| {
-        m.borrow_mut().remove(&key);
+pub(crate) fn clear_memory(key: usize) {
+    memory_controls::write(|m| {
+        m.remove(&key);
     });
-    MEMORY_CATEGORIES.with(|m| {
-        m.borrow_mut().remove(&key);
+    memory_categories::write(|m| {
+        m.remove(&key);
     });
 }
 
@@ -113,11 +121,11 @@ impl Lua {
     /// and during chunk loading.
     pub fn set_memory_limit(&self, limit: usize) -> Result<usize> {
         let state = self.state();
+        let state = state.get();
         unsafe {
             let key = global_key(state);
             let g = (*state).global;
-            let prev = MEMORY_CONTROLS.with(|m| {
-                let mut map = m.borrow_mut();
+            let prev = memory_controls::write(|map| {
                 if let Some(ctrl) = map.get_mut(&key) {
                     // Already installed: just update the cap.
                     let prev = ctrl.limit;
@@ -140,8 +148,8 @@ impl Lua {
                 base_ud,
             });
             let ctrl_ptr = (&*ctrl) as *const MemoryControl as *mut core::ffi::c_void;
-            MEMORY_CONTROLS.with(|m| {
-                m.borrow_mut().insert(key, ctrl);
+            memory_controls::write(|m| {
+                m.insert(key, ctrl);
             });
             (*g).ud = ctrl_ptr;
             (*g).frealloc = Some(limited_alloc);
@@ -162,9 +170,9 @@ impl Lua {
             )));
         }
         let state = self.state();
+        let state = state.get();
         let key = unsafe { global_key(state) };
-        let id = MEMORY_CATEGORIES.with(|m| -> Result<u8> {
-            let mut map = m.borrow_mut();
+        let id = memory_categories::write(|map| -> Result<u8> {
             let cats = map.entry(key).or_insert_with(|| {
                 let mut h = HashMap::new();
                 // id 0 is the implicit "main" category.
@@ -197,9 +205,9 @@ impl Lua {
     /// this only via `heap_dump`, which luaur cannot back — see the module).
     pub fn memory_category_bytes(&self, name: &str) -> Option<usize> {
         let state = self.state();
+        let state = state.get();
         let key = unsafe { global_key(state) };
-        let id =
-            MEMORY_CATEGORIES.with(|m| m.borrow().get(&key).and_then(|c| c.get(name).copied()))?;
+        let id = memory_categories::read(|m| m.get(&key).and_then(|c| c.get(name).copied()))?;
         unsafe {
             let g = (*state).global;
             Some((*g).memcatbytes[id as usize])
@@ -209,5 +217,5 @@ impl Lua {
 
 #[cfg(test)]
 pub(crate) fn memory_controls_len() -> usize {
-    MEMORY_CONTROLS.with(|m| m.borrow().len())
+    memory_controls::read(|m| m.len())
 }

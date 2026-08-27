@@ -29,7 +29,7 @@ use std::marker::PhantomData;
 use crate::callback::{create_callback_function, BoxedCallback};
 use crate::error::{Error, Result};
 use crate::state::{Lua, LuaRef};
-use crate::sync::{MaybeSend, MaybeSync, NotSync, XRc, NOT_SYNC};
+use crate::sync::{MaybeSend, MaybeSync, XRc};
 use crate::sys::*;
 use crate::traits::{FromLua, FromLuaMulti, IntoLua, IntoLuaMulti};
 use crate::value::Value;
@@ -132,14 +132,12 @@ pub trait UserDataFields<T> {
 #[derive(Clone)]
 pub struct AnyUserData {
     pub(crate) reference: XRc<LuaRef>,
-    pub(crate) _not_sync: NotSync,
 }
 
 impl AnyUserData {
     pub(crate) fn from_ref(reference: LuaRef) -> AnyUserData {
         AnyUserData {
             reference: XRc::new(reference),
-            _not_sync: NOT_SYNC,
         }
     }
 
@@ -156,6 +154,7 @@ impl AnyUserData {
     /// `mlua::AnyUserData::to_pointer`.
     pub fn to_pointer(&self) -> *const c_void {
         let state = self.reference.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             let p = lua_topointer(state, -1);
@@ -169,6 +168,7 @@ impl AnyUserData {
     pub fn equals(&self, other: &AnyUserData) -> Result<bool> {
         let lua = self.lua();
         let state = lua.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             other.reference.push();
@@ -183,6 +183,7 @@ impl AnyUserData {
     /// differs.
     fn cell<T: 'static>(&self) -> Result<&UserDataCell<T>> {
         let state = self.reference.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             let ptr = lua_touserdata(state, -1);
@@ -213,6 +214,7 @@ impl AnyUserData {
     /// `TypeId` whenever the userdata carries a luaur-rt wrapper header).
     pub fn type_id(&self) -> Option<TypeId> {
         let state = self.reference.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             let ptr = lua_touserdata(state, -1);
@@ -411,6 +413,7 @@ fn recover_cell<'a, T: 'static>(lua: &Lua, value: &Value) -> Result<&'a UserData
     match value {
         Value::UserData(ud) => {
             let state = lua.state();
+            let state = state.get();
             unsafe {
                 ud.reference.push();
                 let ptr = lua_touserdata(state, -1);
@@ -764,6 +767,7 @@ unsafe fn recover_scoped_cell<'a, T>(
     match value {
         Value::UserData(ud) => {
             let state = lua.state();
+            let state = state.get();
             unsafe {
                 ud.reference.push();
                 let ptr = lua_touserdata(state, -1);
@@ -1048,6 +1052,7 @@ pub(crate) fn create_scoped_userdata<T: UserData>(
     data: T,
 ) -> Result<(AnyUserData, Box<dyn FnOnce()>)> {
     let state = lua.state();
+    let state = state.get();
     let marker = next_scoped_marker();
 
     // 1. Collect fields, methods, and meta-methods (marker-keyed recovery).
@@ -1079,35 +1084,74 @@ pub(crate) fn create_scoped_userdata<T: UserData>(
         }
     }
 
-    if has_fields {
+    // A user-registered `__index` / `__newindex` meta-method
+    // (`add_meta_method(MetaMethod::Index, ..)`) landed in `metatable` above.
+    // It must not be silently overwritten by the field/method dispatch:
+    // mlua chains them — field getter, then method table, then the user
+    // handler — so dynamic lookups keep working alongside methods. (Wiring the
+    // user handler as the *method table's* metatable would not work: the
+    // handler would receive the method table, not the userdata, as `self`.)
+    let user_index = match metatable.raw_get::<Value>("__index")? {
+        Value::Nil => None,
+        v => Some(v),
+    };
+    let user_newindex = match metatable.raw_get::<Value>("__newindex")? {
+        Value::Nil => None,
+        v => Some(v),
+    };
+
+    if has_fields || user_index.is_some() {
         let getters_c = getters.clone();
         let methods_c = method_table.clone();
         let index_fn = lua.create_function(move |_, (ud, key): (Value, Value)| {
+            // 1. Field getter.
             let getter: Value = getters_c.get(key.clone())?;
             if let Value::Function(f) = getter {
                 return f.call::<Value>(ud);
             }
-            let m: Value = methods_c.get(key)?;
-            Ok(m)
+            // 2. Method table.
+            let m: Value = methods_c.raw_get(key.clone())?;
+            if !matches!(m, Value::Nil) {
+                return Ok(m);
+            }
+            // 3. User-registered `__index` handler (function or table).
+            match &user_index {
+                Some(Value::Function(f)) => f.call::<Value>((ud, key)),
+                Some(Value::Table(t)) => t.get(key),
+                _ => Ok(Value::Nil),
+            }
         })?;
         metatable.set("__index", index_fn)?;
+    } else {
+        metatable.set("__index", method_table)?;
+    }
 
+    if has_fields || user_newindex.is_some() {
         let setters_c = setters.clone();
         let newindex_fn =
             lua.create_function(move |_, (ud, key, val): (Value, Value, Value)| {
+                // 1. Field setter.
                 let setter: Value = setters_c.get(key.clone())?;
                 if let Value::Function(f) = setter {
                     f.call::<()>((ud, val))?;
                     return Ok(());
                 }
-                let name = key.to_string().unwrap_or_default();
-                Err(Error::RuntimeError(format!(
-                    "attempt to set unknown field '{name}' on userdata"
-                )))
+                // 2. User-registered `__newindex` handler (function or table).
+                match &user_newindex {
+                    Some(Value::Function(f)) => {
+                        f.call::<()>((ud, key, val))?;
+                        Ok(())
+                    }
+                    Some(Value::Table(t)) => t.set(key, val),
+                    _ => {
+                        let name = key.to_string().unwrap_or_default();
+                        Err(Error::RuntimeError(format!(
+                            "attempt to set unknown field '{name}' on userdata"
+                        )))
+                    }
+                }
             })?;
         metatable.set("__newindex", newindex_fn)?;
-    } else {
-        metatable.set("__index", method_table)?;
     }
 
     // 3. Allocate the scoped userdata holding ScopedCell<T> and move `data` in.
@@ -1139,6 +1183,7 @@ pub(crate) fn create_scoped_userdata<T: UserData>(
     let ud_for_dtor = ud.clone();
     let neutralise: Box<dyn FnOnce()> = Box::new(move || {
         let state = ud_for_dtor.reference.state();
+        let state = state.get();
         unsafe {
             ud_for_dtor.reference.push();
             let ptr = lua_touserdata(state, -1);
@@ -1166,6 +1211,7 @@ pub(crate) fn create_userdata<T: UserData + MaybeSend + MaybeSync + 'static>(
     data: T,
 ) -> Result<AnyUserData> {
     let state = lua.state();
+    let state = state.get();
 
     // 1. Collect fields, methods, and meta-methods.
     let mut collector = Collector::<T>::new();
@@ -1197,39 +1243,74 @@ pub(crate) fn create_userdata<T: UserData + MaybeSend + MaybeSync + 'static>(
         }
     }
 
-    if has_fields {
-        // __index dispatcher: try a field getter, then the method table.
+    // A user-registered `__index` / `__newindex` meta-method
+    // (`add_meta_method(MetaMethod::Index, ..)`) landed in `metatable` above.
+    // It must not be silently overwritten by the field/method dispatch:
+    // mlua chains them — field getter, then method table, then the user
+    // handler — so dynamic lookups keep working alongside methods. (Wiring the
+    // user handler as the *method table's* metatable would not work: the
+    // handler would receive the method table, not the userdata, as `self`.)
+    let user_index = match metatable.raw_get::<Value>("__index")? {
+        Value::Nil => None,
+        v => Some(v),
+    };
+    let user_newindex = match metatable.raw_get::<Value>("__newindex")? {
+        Value::Nil => None,
+        v => Some(v),
+    };
+
+    if has_fields || user_index.is_some() {
         let getters_c = getters.clone();
         let methods_c = method_table.clone();
         let index_fn = lua.create_function(move |_, (ud, key): (Value, Value)| {
+            // 1. Field getter.
             let getter: Value = getters_c.get(key.clone())?;
             if let Value::Function(f) = getter {
                 return f.call::<Value>(ud);
             }
-            // Fall back to the method table.
-            let m: Value = methods_c.get(key)?;
-            Ok(m)
+            // 2. Method table.
+            let m: Value = methods_c.raw_get(key.clone())?;
+            if !matches!(m, Value::Nil) {
+                return Ok(m);
+            }
+            // 3. User-registered `__index` handler (function or table).
+            match &user_index {
+                Some(Value::Function(f)) => f.call::<Value>((ud, key)),
+                Some(Value::Table(t)) => t.get(key),
+                _ => Ok(Value::Nil),
+            }
         })?;
         metatable.set("__index", index_fn)?;
+    } else {
+        metatable.set("__index", method_table)?;
+    }
 
-        // __newindex dispatcher: try a field setter, else raise.
+    if has_fields || user_newindex.is_some() {
         let setters_c = setters.clone();
         let newindex_fn =
             lua.create_function(move |_, (ud, key, val): (Value, Value, Value)| {
+                // 1. Field setter.
                 let setter: Value = setters_c.get(key.clone())?;
                 if let Value::Function(f) = setter {
                     f.call::<()>((ud, val))?;
                     return Ok(());
                 }
-                let name = key.to_string().unwrap_or_default();
-                Err(Error::RuntimeError(format!(
-                    "attempt to set unknown field '{name}' on userdata"
-                )))
+                // 2. User-registered `__newindex` handler (function or table).
+                match &user_newindex {
+                    Some(Value::Function(f)) => {
+                        f.call::<()>((ud, key, val))?;
+                        Ok(())
+                    }
+                    Some(Value::Table(t)) => t.set(key, val),
+                    _ => {
+                        let name = key.to_string().unwrap_or_default();
+                        Err(Error::RuntimeError(format!(
+                            "attempt to set unknown field '{name}' on userdata"
+                        )))
+                    }
+                }
             })?;
         metatable.set("__newindex", newindex_fn)?;
-    } else {
-        // No fields: the metatable's __index is just the method table.
-        metatable.set("__index", method_table)?;
     }
 
     // 3. Allocate the userdata holding UserDataCell<T> and move `data` in.

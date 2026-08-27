@@ -1,9 +1,6 @@
 //! Luau-specific `Lua` extensions: sandboxing, safeenv, fflags, and the
 //! per-VM compiler. Mirrors the Luau-only parts of mlua's `Lua` surface.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-
 use crate::compiler::Compiler;
 use crate::error::{Error, Result};
 use crate::state::Lua;
@@ -11,21 +8,22 @@ use crate::sys::*;
 use crate::table::Table;
 use crate::thread::Thread;
 
-thread_local! {
-    /// Per-VM compiler installed via `Lua::set_compiler`, keyed by global state.
-    static VM_COMPILERS: RefCell<HashMap<*mut core::ffi::c_void, Compiler>> =
-        RefCell::new(HashMap::new());
-
-    /// Per-VM `catch_rust_panics` option (recorded from `LuaOptions`), keyed by
-    /// global state. Currently recorded for parity; see `set_catch_rust_panics`.
-    static VM_CATCH_PANICS: RefCell<HashMap<*mut core::ffi::c_void, bool>> =
-        RefCell::new(HashMap::new());
-
-    /// Per-VM "is sandboxed" flag, keyed by global state. Mirrors mlua's
-    /// `extra.sandboxed`; consulted by `Lua::set_globals`.
-    static VM_SANDBOXED: RefCell<HashMap<*mut core::ffi::c_void, bool>> =
-        RefCell::new(HashMap::new());
-}
+// Per-VM side stores, keyed by global state (thread-local without `send`,
+// process-global `RwLock` maps with it — see `vm_state_map!`).
+crate::sync::vm_state_map!(
+    /// Per-VM compiler installed via `Lua::set_compiler`.
+    vm_compilers: Compiler
+);
+crate::sync::vm_state_map!(
+    /// Per-VM `catch_rust_panics` option (recorded from `LuaOptions`).
+    /// Currently recorded for parity; see `set_catch_rust_panics`.
+    vm_catch_panics: bool
+);
+crate::sync::vm_state_map!(
+    /// Per-VM "is sandboxed" flag. Mirrors mlua's `extra.sandboxed`;
+    /// consulted by `Lua::set_globals`.
+    vm_sandboxed: bool
+);
 
 /// Registry name under which `sandbox(true)` saves the ORIGINAL globals table so
 /// `sandbox(false)` can restore it. Kept in the state's registry (freed on
@@ -34,8 +32,8 @@ thread_local! {
 /// (the state could never drop) if the caller dropped a still-sandboxed `Lua`.
 const SANDBOX_SAVED_GLOBALS_NAME: &str = "__luaur_sandbox_saved_globals";
 
-unsafe fn global_key(state: *mut lua_State) -> *mut core::ffi::c_void {
-    unsafe { (*state).global as *mut core::ffi::c_void }
+unsafe fn global_key(state: *mut lua_State) -> usize {
+    unsafe { (*state).global as usize }
 }
 
 /// Drop this VM's compiler / catch-panics / sandboxed-flag entries so they don't
@@ -44,14 +42,14 @@ unsafe fn global_key(state: *mut lua_State) -> *mut core::ffi::c_void {
 /// lives in the registry and is freed with the state on `lua_close`.)
 pub(crate) fn clear_vm_state(state: *mut lua_State) {
     let key = unsafe { global_key(state) };
-    VM_COMPILERS.with(|m| {
-        m.borrow_mut().remove(&key);
+    vm_compilers::write(|m| {
+        m.remove(&key);
     });
-    VM_CATCH_PANICS.with(|m| {
-        m.borrow_mut().remove(&key);
+    vm_catch_panics::write(|m| {
+        m.remove(&key);
     });
-    VM_SANDBOXED.with(|m| {
-        m.borrow_mut().remove(&key);
+    vm_sandboxed::write(|m| {
+        m.remove(&key);
     });
 }
 
@@ -71,9 +69,10 @@ impl Lua {
     /// exercisable here (see `tests/mlua_luau.rs`).
     pub fn sandbox(&self, enabled: bool) -> Result<()> {
         let state = self.state();
+        let state = state.get();
         let key = unsafe { global_key(state) };
-        VM_SANDBOXED.with(|m| {
-            m.borrow_mut().insert(key, enabled);
+        vm_sandboxed::write(|m| {
+            m.insert(key, enabled);
         });
         unsafe {
             if enabled {
@@ -138,6 +137,7 @@ impl Lua {
     /// path (needed when globals/`__index` may change at runtime).
     pub fn set_safeenv(&self, enabled: bool) {
         let state = self.state();
+        let state = state.get();
         unsafe {
             lua_setsafeenv(state, LUA_GLOBALSINDEX, enabled as c_int);
         }
@@ -149,9 +149,10 @@ impl Lua {
     /// `mlua::Lua::set_compiler`.
     pub fn set_compiler(&self, compiler: Compiler) {
         let state = self.state();
+        let state = state.get();
         let key = unsafe { global_key(state) };
-        VM_COMPILERS.with(|m| {
-            m.borrow_mut().insert(key, compiler);
+        vm_compilers::write(|m| {
+            m.insert(key, compiler);
         });
     }
 
@@ -164,9 +165,10 @@ impl Lua {
     /// — see the deferred `test_panic` in `tests/mlua_core.rs`.
     pub(crate) fn set_catch_rust_panics(&self, enabled: bool) {
         let state = self.state();
+        let state = state.get();
         let key = unsafe { global_key(state) };
-        VM_CATCH_PANICS.with(|m| {
-            m.borrow_mut().insert(key, enabled);
+        vm_catch_panics::write(|m| {
+            m.insert(key, enabled);
         });
     }
 
@@ -174,15 +176,17 @@ impl Lua {
     /// mlua's `extra.sandboxed` flag; consulted by [`Lua::set_globals`].
     pub(crate) fn is_sandboxed(&self) -> bool {
         let state = self.state();
+        let state = state.get();
         let key = unsafe { global_key(state) };
-        VM_SANDBOXED.with(|m| m.borrow().get(&key).copied().unwrap_or(false))
+        vm_sandboxed::read(|m| m.get(&key).copied().unwrap_or(false))
     }
 
     /// The VM-default compiler installed via [`Lua::set_compiler`], if any.
     pub(crate) fn vm_compiler(&self) -> Option<Compiler> {
         let state = self.state();
+        let state = state.get();
         let key = unsafe { global_key(state) };
-        VM_COMPILERS.with(|m| m.borrow().get(&key).cloned())
+        vm_compilers::read(|m| m.get(&key).cloned())
     }
 
     /// Set (or clear) the metatable shared by all values of a Luau built-in
@@ -241,6 +245,7 @@ pub trait TypeMetatable: private::Sealed {
     /// Install (or clear) the shared metatable for this type.
     fn set_type_metatable(lua: &Lua, metatable: Option<Table>) {
         let state = lua.state();
+        let state = state.get();
         unsafe {
             Self::push_representative(state);
             match metatable {
@@ -258,6 +263,7 @@ pub trait TypeMetatable: private::Sealed {
     /// The shared metatable for this type, if installed.
     fn type_metatable(lua: &Lua) -> Option<Table> {
         let state = lua.state();
+        let state = state.get();
         unsafe {
             Self::push_representative(state);
             let has = crate::sys::lua_getmetatable(state, -1);
@@ -347,5 +353,5 @@ unsafe fn noop_cfn(_state: *mut lua_State) -> c_int {
 
 #[cfg(test)]
 pub(crate) fn vm_compilers_len() -> usize {
-    VM_COMPILERS.with(|m| m.borrow().len())
+    vm_compilers::read(|m| m.len())
 }

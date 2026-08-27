@@ -364,6 +364,7 @@ fn is_exact_integer(n: f64) -> bool {
 /// Push a [`Value`] onto the top of the Lua stack.
 pub(crate) fn push_value(lua: &Lua, value: &Value) -> Result<()> {
     let state = lua.state();
+    let state = state.get();
     unsafe {
         match value {
             Value::Nil => lua_pushnil(state),
@@ -399,6 +400,7 @@ pub(crate) fn push_value(lua: &Lua, value: &Value) -> Result<()> {
 /// reference types this registers a registry reference.
 pub(crate) fn value_from_stack(lua: &Lua, idx: c_int) -> Result<Value> {
     let state = lua.state();
+    let state = state.get();
     unsafe {
         let t = lua_type(state, idx);
         let value = match t {

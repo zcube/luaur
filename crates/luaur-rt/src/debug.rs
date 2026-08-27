@@ -89,6 +89,7 @@ impl Lua {
     /// that level. Mirrors the Luau-feasible part of `mlua::Lua::inspect_stack`.
     pub fn inspect_stack(&self, level: usize) -> Option<Debug> {
         let state = self.state();
+        let state = state.get();
         unsafe {
             let mut ar: LuaDebug = core::mem::zeroed();
             // `lua_getinfo` with a non-negative level walks call-info depth.

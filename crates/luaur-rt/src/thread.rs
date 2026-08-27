@@ -21,7 +21,7 @@ use crate::error::{Error, Result};
 use crate::function::Function;
 use crate::multi::MultiValue;
 use crate::state::{Lua, LuaRef};
-use crate::sync::{NotSync, XRc, NOT_SYNC};
+use crate::sync::XRc;
 use crate::sys::*;
 use crate::traits::{FromLuaMulti, IntoLua, IntoLuaMulti};
 
@@ -53,38 +53,45 @@ pub(crate) enum AsyncResume {
 
 /// A handle to a Lua thread (coroutine). Mirrors `mlua::Thread`.
 ///
-/// Under the `send` feature it is `Send` but never `Sync` — see
-/// [`crate::sync::NotSync`].
+/// Under the `send` feature it is `Send + Sync` (all VM access is
+/// serialized by the per-VM lock — see [`crate::state::StateRef`]; the
+/// coroutine shares its parent VM's lock, since the lock is keyed by the
+/// shared `global_State`).
 #[derive(Clone)]
 pub struct Thread {
     pub(crate) reference: XRc<LuaRef>,
     /// The raw coroutine state pointer (cached from the referenced value).
     pub(crate) thread_state: *mut lua_State,
-    pub(crate) _not_sync: NotSync,
 }
 
-// `Thread` caches a raw `*mut lua_State` (the coroutine), which is `!Send` by
-// default. Under the move-only `send` contract it is sound to move a `Thread`
-// to another thread (the cached pointer stays valid; the VM is single-threaded
-// in use). `!Sync` is preserved by the `NotSync` marker.
+// `Thread` caches a raw `*mut lua_State` (the coroutine), which is `!Send` /
+// `!Sync` by default. Sound because the cached pointer is only dereferenced
+// through code paths that hold the per-VM lock (the coroutine shares its
+// parent's `global_State`, and the lock is keyed by that pointer); the public
+// `Thread::state()` accessor merely *returns* the pointer, and using it is the
+// caller's unsafe responsibility, exactly like `mlua::Thread::state`.
 #[cfg(feature = "send")]
 unsafe impl Send for Thread {}
+#[cfg(feature = "send")]
+unsafe impl Sync for Thread {}
 
 impl Thread {
     /// Build a [`Thread`] from a registry ref to a thread value. Caches the
     /// coroutine's raw state via `lua_tothread`.
     pub(crate) fn from_ref(reference: LuaRef) -> Thread {
-        let state = reference.state();
-        let thread_state = unsafe {
-            reference.push();
-            let ts = lua_tothread(state, -1);
-            lua_pop(state, 1);
-            ts
+        let thread_state = {
+            let state = reference.state();
+            let state = state.get();
+            unsafe {
+                reference.push();
+                let ts = lua_tothread(state, -1);
+                lua_pop(state, 1);
+                ts
+            }
         };
         Thread {
             reference: XRc::new(reference),
             thread_state,
-            _not_sync: NOT_SYNC,
         }
     }
 
@@ -118,6 +125,7 @@ impl Thread {
         }
 
         let parent = lua.state();
+        let parent = parent.get();
         let co = self.thread_state;
         unsafe {
             let nargs = args.len() as c_int;
@@ -149,6 +157,7 @@ impl Thread {
         }
 
         let parent = lua.state();
+        let parent = parent.get();
         let co = self.thread_state;
         unsafe {
             if lua_checkstack(co, 2) == 0 {
@@ -166,6 +175,7 @@ impl Thread {
     /// moved onto the coroutine stack.
     unsafe fn resume_inner<R: FromLuaMulti>(&self, lua: &Lua, nargs: c_int) -> Result<R> {
         let parent = lua.state();
+        let parent = parent.get();
         let co = self.thread_state;
         let status = unsafe { lua_resume(co, parent, nargs) };
         unsafe { self.finish_resume::<R>(lua, status) }
@@ -175,6 +185,7 @@ impl Thread {
     /// back to the parent, and convert.
     unsafe fn finish_resume<R: FromLuaMulti>(&self, lua: &Lua, status: c_int) -> Result<R> {
         let parent = lua.state();
+        let parent = parent.get();
         let co = self.thread_state;
         unsafe {
             if status != status::OK && status != status::YIELD && status != status::BREAK {
@@ -230,6 +241,7 @@ impl Thread {
     pub(crate) fn resume_for_async(&self, args: MultiValue) -> Result<AsyncResume> {
         let lua = self.lua();
         let parent = lua.state();
+        let parent = parent.get();
         let co = self.thread_state;
         unsafe {
             let nargs = args.len() as c_int;
@@ -300,6 +312,7 @@ impl Thread {
         }
         let lua = self.lua();
         let parent = lua.state();
+        let parent = parent.get();
         let co = self.thread_state;
         unsafe {
             if lua_checkstack(co, 2) == 0 {
@@ -320,6 +333,7 @@ impl Thread {
     pub fn status(&self) -> ThreadStatus {
         let lua = self.lua();
         let parent = lua.state();
+        let parent = parent.get();
         let co = self.thread_state;
         // A thread whose state is the currently-running state is "Running".
         if co == parent {
@@ -403,6 +417,7 @@ impl Thread {
         }
         let lua = self.lua();
         let parent = lua.state();
+        let parent = parent.get();
         let co = self.thread_state;
         unsafe {
             lua_resetthread(co);
@@ -422,6 +437,7 @@ impl Thread {
     /// A raw pointer identifying this thread. Mirrors `mlua::Thread::to_pointer`.
     pub fn to_pointer(&self) -> *const c_void {
         let state = self.reference.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             let p = lua_topointer(state, -1);
@@ -504,6 +520,7 @@ impl Lua {
     /// `mlua::Lua::create_thread`.
     pub fn create_thread(&self, func: Function) -> Result<Thread> {
         let state = self.state();
+        let state = state.get();
         unsafe {
             // Create a new thread; it is pushed on the parent stack.
             let co = lua_newthread(state);
@@ -529,6 +546,7 @@ impl Lua {
     /// (matching mlua).
     pub fn current_thread(&self) -> Thread {
         let state = self.state();
+        let state = state.get();
         // If we are running on an implicit `call_async` coroutine, report the
         // owner thread that issued the call.
         #[cfg(feature = "async")]

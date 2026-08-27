@@ -33,11 +33,14 @@ async = ["dep:futures-util"]
 # enum are byte-for-byte unchanged.
 typecheck = ["dep:luaur-analysis", "dep:luaur-config"]
 # Makes `Lua` and all of its handles (`Table`/`Function`/`String`/
-# `AnyUserData`/`Thread`/`Buffer`/`Value`/`RegistryKey`) `Send`, mirroring
-# mlua's `send` feature: the whole VM can be **moved** to another thread (the
-# user guarantees serialized access). It does NOT make the VM thread-safe and
-# does NOT make it `Sync`. Off by default so the base build/API is byte-for-byte
-# unchanged (`XRc` = `Rc`, `MaybeSend`/`MaybeSync` are empty markers).
+# `AnyUserData`/`Thread`/`Buffer`/`Value`/`RegistryKey`) `Send + Sync`,
+# mirroring mlua's `send` feature: every VM operation acquires a per-VM
+# re-entrant mutex (mlua's `ReentrantMutex<RawLua>` design), so handles can be
+# shared across threads — including inside `Arc<dyn Fn + Send + Sync>` host
+# containers — with all access serialized; same-thread re-entry (callbacks
+# calling back into the VM) does not deadlock. Off by default so the base
+# build/API is byte-for-byte unchanged (`XRc` = `Rc`, `MaybeSend`/`MaybeSync`
+# are empty markers, no lock exists).
 #
 # `send` composes with `async`: the async bridge's per-VM waker + implicit-thread
 # ownership map live in a process-wide table keyed by the VM's global-state

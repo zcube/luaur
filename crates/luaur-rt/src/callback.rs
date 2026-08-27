@@ -281,6 +281,7 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 /// [`Lua::create_function`] and the userdata method machinery.
 pub(crate) fn create_callback_function(lua: &Lua, callback: BoxedCallback) -> Result<Function> {
     let state = lua.state();
+    let state = state.get();
     unsafe {
         // Allocate userdata sized for a BoxedCallback, with our dtor.
         let storage = lua_newuserdatadtor(
@@ -327,6 +328,7 @@ pub(crate) fn create_callback_function(lua: &Lua, callback: BoxedCallback) -> Re
 pub(crate) fn destruct_callback(func: &Function) {
     let lua = func.lua();
     let state = lua.state();
+    let state = state.get();
     unsafe {
         // Push the function, then fetch its upvalue 1 (the callback userdata).
         func.push_to_stack();
