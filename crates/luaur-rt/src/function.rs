@@ -3,25 +3,24 @@
 use crate::error::Result;
 use crate::multi::MultiValue;
 use crate::state::{Lua, LuaRef};
-use crate::sync::{MaybeSend, NotSync, XRc, NOT_SYNC};
+use crate::sync::{MaybeSend, XRc};
 use crate::sys::*;
 use crate::traits::{FromLuaMulti, IntoLuaMulti};
 
 /// A handle to a callable Lua value (a Lua closure or a Rust function).
 ///
-/// Mirrors `mlua::Function`. Under the `send` feature it is `Send` but never
-/// `Sync` — see [`crate::sync::NotSync`].
+/// Mirrors `mlua::Function`. Under the `send` feature it is `Send + Sync`
+/// (all VM access is serialized by the per-VM lock — see
+/// [`crate::state::StateRef`]).
 #[derive(Clone)]
 pub struct Function {
     pub(crate) reference: XRc<LuaRef>,
-    pub(crate) _not_sync: NotSync,
 }
 
 impl Function {
     pub(crate) fn from_ref(reference: LuaRef) -> Function {
         Function {
             reference: XRc::new(reference),
-            _not_sync: NOT_SYNC,
         }
     }
 
@@ -42,6 +41,7 @@ impl Function {
     pub fn call<R: FromLuaMulti>(&self, args: impl IntoLuaMulti) -> Result<R> {
         let lua = self.lua();
         let state = lua.state();
+        let state = state.get();
         let args: MultiValue = args.into_lua_multi(&lua)?;
 
         unsafe {
@@ -185,7 +185,7 @@ impl Function {
             // The coroutine is *implicit* (created by `call_async`): register it
             // so `Lua::current_thread` running on it resolves to the owner (the
             // thread that issued this call). Mirrors mlua's thread-ownership map.
-            crate::async_support::register_implicit_thread(thread.state(), lua.state());
+            crate::async_support::register_implicit_thread(thread.state(), lua.state().get());
             let mut th = thread.into_async(args)?;
             th.set_implicit(true);
             Ok(th)
@@ -265,6 +265,7 @@ impl Function {
     /// Mirrors `mlua::Function::to_pointer`.
     pub fn to_pointer(&self) -> *const std::ffi::c_void {
         let state = self.reference.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             let p = lua_topointer(state, -1);
@@ -278,6 +279,7 @@ impl Function {
     pub fn environment(&self) -> Option<crate::table::Table> {
         let lua = self.lua();
         let state = lua.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             // `lua_getfenv` only applies to Lua closures; a C function has no
@@ -304,6 +306,7 @@ impl Function {
     pub fn set_environment(&self, env: crate::table::Table) -> Result<bool> {
         let lua = self.lua();
         let state = lua.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             if !self.is_lua_closure() {
@@ -323,6 +326,7 @@ impl Function {
     /// Lua closure (vs a C function). Determined via the debug `what` field.
     unsafe fn is_lua_closure(&self) -> bool {
         let state = self.reference.state();
+        let state = state.get();
         unsafe {
             // The function is on top of the stack (index -1). Ask lua_getinfo
             // about it via the ">" level convention: push the function and use
@@ -347,6 +351,7 @@ impl Function {
     pub fn info(&self) -> FunctionInfo {
         let lua = self.lua();
         let state = lua.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             let mut ar: LuaDebug = core::mem::zeroed();

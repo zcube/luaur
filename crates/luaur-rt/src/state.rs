@@ -19,16 +19,18 @@
 //! ## The `send` feature
 //!
 //! Under the `send` feature (mirroring mlua) the shared interior uses
-//! [`XRc`] = `Arc` instead of `Rc`, and [`LuaInner`] / [`LuaRef`] carry a
-//! documented `unsafe impl Send`. That makes [`Lua`] and every handle `Send` so
-//! the whole VM can be **moved** to another thread. It is *not* made `Sync`: the
-//! VM is still single-threaded, the user must serialize all access, and only the
-//! ownership *transfer* crosses threads (exactly mlua's `send` contract).
+//! [`XRc`] = `Arc` instead of `Rc`, and [`Lua`] and every handle become
+//! **`Send + Sync`**. Soundness comes from a per-VM re-entrant mutex
+//! ([`crate::sync::ReentrantMutex`], mlua's `ReentrantMutex<RawLua>` design):
+//! the raw `*mut lua_State` is only reachable through [`Lua::state`] /
+//! `LuaRef::state`, which return a [`StateRef`] guard holding that lock, so all
+//! VM access is serialized across threads while same-thread re-entry (a
+//! callback calling back into the VM) remains free of deadlocks.
 
 use std::cell::Cell;
 
 use crate::error::{Error, Result};
-use crate::sync::{MaybeSend, MaybeSync, NotSync, XRc, XWeak, NOT_SYNC};
+use crate::sync::{MaybeSend, MaybeSync, XRc, XWeak};
 use crate::sys::*;
 use crate::value::Value;
 
@@ -47,6 +49,13 @@ pub(crate) struct LuaInner {
     /// trampoline builds a *borrowed* [`Lua`] around the calling thread's
     /// state and must not close it.
     owned: bool,
+    /// The per-VM re-entrant lock serializing all access to `state` (`send`
+    /// feature). Shared — via the process-global registry keyed by the
+    /// `global_State` pointer — with every other `LuaInner` wrapping the same
+    /// VM (borrowed trampoline handles, coroutine threads), so all of them
+    /// contend on one mutex. See [`crate::sync::vm_lock_registry`].
+    #[cfg(feature = "send")]
+    vm_lock: std::sync::Arc<crate::sync::ReentrantMutex>,
     /// Host type definitions accumulated via [`Lua::add_definitions`] (the
     /// `typecheck` feature), in Luau definition-file syntax. Each registration
     /// is appended separated by a newline; the whole buffer is fed to the
@@ -64,15 +73,69 @@ impl LuaInner {
         LuaInner {
             state,
             owned,
+            // SAFETY: every constructor passes a valid, non-null state whose
+            // global_State pointer is stable for the VM's lifetime.
+            #[cfg(feature = "send")]
+            vm_lock: crate::sync::vm_lock_registry::lock_for(unsafe { (*state).global as usize }),
             #[cfg(feature = "typecheck")]
             typecheck_defs: std::cell::RefCell::new(String::new()),
         }
+    }
+
+    /// Acquire the VM lock (under `send`) and hand back the raw state pointer
+    /// behind the [`StateRef`] guard. The single funnel through which all VM
+    /// access obtains the pointer.
+    #[inline]
+    pub(crate) fn lock_state(&self) -> StateRef<'_> {
+        StateRef {
+            ptr: self.state,
+            #[cfg(feature = "send")]
+            _guard: self.vm_lock.lock(),
+            #[cfg(not(feature = "send"))]
+            _life: std::marker::PhantomData,
+        }
+    }
+}
+
+/// A locked view of a VM's raw `*mut lua_State`.
+///
+/// Under the `send` feature this guard holds the VM's per-state
+/// [`ReentrantMutex`](crate::sync::ReentrantMutex) for as long as it lives, so
+/// binding one at the top of an operation (`let state = lua.state(); let state
+/// = state.get();` — the shadowed guard stays alive to the end of the scope)
+/// serializes the whole operation against other threads. Without the feature it
+/// is a zero-cost wrapper around the pointer.
+///
+/// Obtain the raw pointer with [`StateRef::get`]. Note that a guard created as
+/// a *temporary* (`foo(lua.state().get())`) only lives to the end of that
+/// statement — fine for a single FFI call, but any multi-statement stack
+/// sequence must bind the guard.
+pub(crate) struct StateRef<'a> {
+    ptr: *mut lua_State,
+    #[cfg(feature = "send")]
+    _guard: crate::sync::ReentrantGuard<'a>,
+    #[cfg(not(feature = "send"))]
+    _life: std::marker::PhantomData<&'a ()>,
+}
+
+impl StateRef<'_> {
+    /// The raw state pointer. Only meaningful while the guard is alive.
+    #[inline]
+    pub(crate) fn get(&self) -> *mut lua_State {
+        self.ptr
     }
 }
 
 impl Drop for LuaInner {
     fn drop(&mut self) {
         if self.owned && !self.state.is_null() {
+            // Serialize the whole teardown against any straggler access from
+            // borrowed handles on other threads, and let userdata destructors
+            // that drop handles (LuaRef::drop locks re-entrantly) run freely.
+            #[cfg(feature = "send")]
+            let lock_key = unsafe { (*self.state).global as usize };
+            #[cfg(feature = "send")]
+            let vm_guard = self.vm_lock.lock();
             // Evict every per-VM thread-local entry keyed by this state before
             // closing it, so none of them leaks one slot per state created. All
             // are keyed by the still-valid state/global pointer here. (The serde
@@ -103,22 +166,26 @@ impl Drop for LuaInner {
             }
             // Now the allocator is no longer needed: drop its control block.
             crate::memory::clear_memory(mem_key);
+            // The state is gone: release the lock, then drop its registry
+            // entry so the (possibly reused) global pointer can key a new VM.
+            // Outstanding Arc clones in borrowed inners keep the mutex object
+            // itself alive, so a late lock on a dead VM parks harmlessly.
+            #[cfg(feature = "send")]
+            {
+                drop(vm_guard);
+                crate::sync::vm_lock_registry::unregister(lock_key);
+            }
         }
     }
 }
 
-// Under the `send` feature, allow a `Lua` (and every handle, transitively) to be
-// **moved** across threads. The raw `*mut lua_State` is `!Send`/`!Sync` by
-// default; these impls encode luaur-rt's documented contract — single-threaded
-// *use*, only *ownership transfer* across threads, never concurrent access.
-//
-// `Send` is the property we actually expose. `Sync` is needed only as an
-// internal obligation: `XRc<LuaInner>` is `Arc<LuaInner>` under the feature, and
-// `Arc<T>: Send` requires `T: Send + Sync`. We therefore mark `LuaInner` (the
-// non-public interior) `Sync`, and then keep the *public* `Lua`/handle types
-// `!Sync` with a `NotSync` phantom marker (see [`NotSync`]). Net effect: the VM
-// can be moved across threads but never shared/accessed concurrently — exactly
-// mlua's `send` contract, minus mlua's extra `Sync` (luaur-rt stays `!Sync`).
+// Under the `send` feature, `Lua` (and every handle, transitively) is
+// `Send + Sync`, exactly like mlua's `send` build. The raw `*mut lua_State` is
+// `!Send`/`!Sync` by default; these impls are sound because the pointer is only
+// reachable through `LuaInner::lock_state` (via `Lua::state` / `LuaRef::state`),
+// which acquires the per-VM re-entrant mutex — all cross-thread access to the
+// VM is serialized by that lock. The `RefCell` interior (`typecheck_defs`) is
+// likewise only touched with the lock held.
 #[cfg(feature = "send")]
 unsafe impl Send for LuaInner {}
 #[cfg(feature = "send")]
@@ -128,12 +195,14 @@ unsafe impl Sync for LuaInner {}
 ///
 /// Mirrors `mlua::Lua`. Cloning produces another handle to the **same** VM
 /// (the inner state is shared via `Rc`), exactly like mlua.
+///
+/// Under the `send` feature `Lua` is `Send + Sync` (mlua parity): all VM access
+/// is serialized by an internal per-VM re-entrant mutex, so shared handles may
+/// be used from several threads (one at a time — callers block while another
+/// thread is inside the VM).
 #[derive(Clone)]
 pub struct Lua {
     pub(crate) inner: XRc<LuaInner>,
-    /// Keeps `Lua` `!Sync` under the `send` feature (the VM is move-only, never
-    /// shareable). A zero-sized `()` under the default build. See [`NotSync`].
-    pub(crate) _not_sync: NotSync,
 }
 
 impl Lua {
@@ -150,7 +219,6 @@ impl Lua {
             lua_l_openlibs(state);
             Lua {
                 inner: XRc::new(LuaInner::new(state, true)),
-                _not_sync: NOT_SYNC,
             }
         }
     }
@@ -165,7 +233,6 @@ impl Lua {
         assert!(!state.is_null(), "lua_l_newstate returned null");
         Lua {
             inner: XRc::new(LuaInner::new(state, true)),
-            _not_sync: NOT_SYNC,
         }
     }
 
@@ -206,16 +273,26 @@ impl Lua {
             }
             let lua = Lua {
                 inner: XRc::new(LuaInner::new(state, true)),
-                _not_sync: NOT_SYNC,
             };
             lua.set_catch_rust_panics(options.catch_rust_panics);
             Ok(lua)
         }
     }
 
-    /// The raw state pointer. Internal use only.
+    /// The state pointer behind the VM-lock guard. Internal use only.
+    ///
+    /// Under `send` this acquires the per-VM re-entrant mutex; bind the guard
+    /// (`let state = self.state(); let state = state.get();`) so a
+    /// multi-statement stack sequence stays serialized end to end.
     #[inline]
-    pub(crate) fn state(&self) -> *mut lua_State {
+    pub(crate) fn state(&self) -> StateRef<'_> {
+        self.inner.lock_state()
+    }
+
+    /// The raw state pointer **without** taking the VM lock. Only for identity
+    /// (pointer comparison / map keys) — never to call into the VM.
+    #[inline]
+    pub(crate) fn state_ptr(&self) -> *mut lua_State {
         self.inner.state
     }
 
@@ -228,14 +305,15 @@ impl Lua {
     pub(crate) unsafe fn from_borrowed(state: *mut lua_State) -> Lua {
         Lua {
             inner: XRc::new(LuaInner::new(state, false)),
-            _not_sync: NOT_SYNC,
         }
     }
 
     /// Register a value sitting at stack index `idx` in the registry and return
     /// a [`LuaRef`] that owns the slot. Does not pop the value.
     pub(crate) fn register_ref(&self, idx: c_int) -> LuaRef {
-        let id = unsafe { lua_ref(self.state(), idx) };
+        let state = self.state();
+        let state = state.get();
+        let id = unsafe { lua_ref(state, idx) };
         LuaRef {
             inner: self.inner.clone(),
             id: Cell::new(id),
@@ -244,8 +322,10 @@ impl Lua {
 
     /// Pop the top stack value and register it, returning a [`LuaRef`].
     pub(crate) fn pop_ref(&self) -> LuaRef {
+        let state = self.state();
+        let state = state.get();
         let r = self.register_ref(-1);
-        unsafe { lua_pop(self.state(), 1) };
+        unsafe { lua_pop(state, 1) };
         r
     }
 }
@@ -277,10 +357,7 @@ impl WeakLua {
     /// Try to obtain a strong [`Lua`] handle. Returns `None` if the VM has
     /// already been destroyed. Mirrors `mlua::WeakLua::try_upgrade`.
     pub fn try_upgrade(&self) -> Option<Lua> {
-        self.0.upgrade().map(|inner| Lua {
-            inner,
-            _not_sync: NOT_SYNC,
-        })
+        self.0.upgrade().map(|inner| Lua { inner })
     }
 
     /// Obtain a strong [`Lua`] handle, panicking if the VM has been destroyed.
@@ -310,6 +387,7 @@ impl Lua {
     /// environment (the table reachable at `LUA_GLOBALSINDEX`).
     pub fn globals(&self) -> Table {
         let state = self.state();
+        let state = state.get();
         unsafe {
             // Push the globals table (a copy of the LUA_GLOBALSINDEX pseudo
             // value) and take a ref to it.
@@ -376,7 +454,7 @@ impl Lua {
     /// Mirrors `mlua::Lua::gc_collect` (infallible here — luaur's `lua_gc`
     /// cannot fail for `collect`).
     pub fn gc_collect(&self) -> Result<()> {
-        lua_gc(self.state(), lua_GCOp::LUA_GCCOLLECT as c_int, 0);
+        lua_gc(self.state().get(), lua_GCOp::LUA_GCCOLLECT as c_int, 0);
         Ok(())
     }
 
@@ -545,6 +623,7 @@ impl Lua {
     /// `None`). Mirrors `mlua::Lua::coerce_integer`.
     pub fn coerce_integer(&self, value: Value) -> Result<Option<crate::value::Integer>> {
         let state = self.state();
+        let state = state.get();
         unsafe {
             self.push_value(&value)?;
             let mut isnum: c_int = 0;
@@ -566,6 +645,7 @@ impl Lua {
     /// `mlua::Lua::coerce_number`.
     pub fn coerce_number(&self, value: Value) -> Result<Option<crate::value::Number>> {
         let state = self.state();
+        let state = state.get();
         unsafe {
             self.push_value(&value)?;
             let mut isnum: c_int = 0;
@@ -592,6 +672,7 @@ impl Lua {
             ));
         }
         let state = self.state();
+        let state = state.get();
         unsafe {
             globals.push_to_stack();
             lua_replace(state, LUA_GLOBALSINDEX);
@@ -606,6 +687,7 @@ impl Lua {
     /// produced by `luaL_traceback`.
     pub fn traceback(&self, msg: Option<&str>, level: usize) -> Result<LuaString> {
         let state = self.state();
+        let state = state.get();
         unsafe {
             lua_l_traceback(state, state, msg, level as c_int);
             // luaL_traceback pushes the resulting string onto the stack.
@@ -708,10 +790,10 @@ pub(crate) struct LuaRef {
 }
 
 // `LuaRef` is shared behind `XRc<LuaRef>` (`Arc<LuaRef>` under the feature) by
-// every handle, so it must be `Send + Sync` for the handles to be `Send`. The
-// `Cell<c_int>` slot is only ever mutated on the owning thread (the move-only
-// contract); marking `LuaRef` `Sync` is sound under that contract. Handles stay
-// `!Sync` via their own `NotSync` markers.
+// every handle, so it must be `Send + Sync` for the handles to be `Send + Sync`.
+// Sound because every VM access goes through `state()` (the per-VM re-entrant
+// lock) and the `Cell<c_int>` slot is written only at construction — reads from
+// other threads happen with the lock held (push/clone/drop all lock).
 #[cfg(feature = "send")]
 unsafe impl Send for LuaRef {}
 #[cfg(feature = "send")]
@@ -722,13 +804,19 @@ impl LuaRef {
     pub(crate) fn lua(&self) -> Lua {
         Lua {
             inner: self.inner.clone(),
-            _not_sync: NOT_SYNC,
         }
     }
 
-    /// The raw state pointer this ref belongs to.
+    /// The state pointer behind the VM-lock guard (see [`Lua::state`]).
     #[inline]
-    pub(crate) fn state(&self) -> *mut lua_State {
+    pub(crate) fn state(&self) -> StateRef<'_> {
+        self.inner.lock_state()
+    }
+
+    /// The raw state pointer **without** taking the VM lock. Only for identity
+    /// (pointer comparison / map keys) — never to call into the VM.
+    #[inline]
+    pub(crate) fn state_ptr(&self) -> *mut lua_State {
         self.inner.state
     }
 
@@ -747,9 +835,11 @@ impl LuaRef {
         // recovers them. luaur exposes this through getfield on the registry
         // via the same mechanism `lua_getref` uses in upstream Luau:
         // `lua_rawgeti(L, LUA_REGISTRYINDEX, id)`.
+        let state = self.state();
+        let state = state.get();
         unsafe {
             luaur_vm::functions::lua_rawgeti::lua_rawgeti(
-                self.state(),
+                state,
                 luaur_vm::macros::lua_registryindex::LUA_REGISTRYINDEX,
                 self.id.get(),
             );
@@ -760,7 +850,10 @@ impl LuaRef {
 impl Clone for LuaRef {
     fn clone(&self) -> Self {
         // Re-push the value and take a fresh registry slot, so each clone owns
-        // an independent slot (simplest correct behavior).
+        // an independent slot (simplest correct behavior). Hold the VM lock
+        // across the push + pop_ref pair so the intermediate stack value can't
+        // interleave with another thread's stack use.
+        let _vm = self.state();
         self.push();
         let new = self.lua().pop_ref();
         new
@@ -770,9 +863,12 @@ impl Clone for LuaRef {
 impl Drop for LuaRef {
     fn drop(&mut self) {
         let id = self.id.get();
-        // Only unref live, real slots.
+        // Only unref live, real slots. A handle may be dropped from any thread
+        // (under `send`), so serialize against the VM like every other access.
         if id > 0 && !self.inner.state.is_null() {
-            unsafe { lua_unref(self.inner.state, id) };
+            let state = self.state();
+            let state = state.get();
+            unsafe { lua_unref(state, id) };
         }
     }
 }
@@ -793,6 +889,7 @@ impl Lua {
     /// mirroring Lua's `tostring`/`luaL_tolstring`.
     pub(crate) fn value_to_string(&self, value: &Value) -> Result<String> {
         let state = self.state();
+        let state = state.get();
         unsafe {
             self.push_value(value)?;
             let mut len = 0usize;
@@ -814,6 +911,7 @@ impl Lua {
     /// object is on top of the stack; pops it.
     pub(crate) fn pop_error(&self, status: c_int) -> Error {
         let state = self.state();
+        let state = state.get();
         unsafe {
             // First, see if the error object is one of our *structured* error
             // userdata (raised for scope-destruction errors). If so, recover the

@@ -27,18 +27,25 @@
 //! assert_eq!(sum, 5);
 //! ```
 //!
-//! ## Single-threaded
+//! ## Threading
 //!
-//! Like mlua's default, [`Lua`] is single-threaded: it is built on `Rc`, so it
-//! is neither `Send` nor `Sync`. Clone a [`Lua`] to get another handle to the
-//! same VM.
+//! Like mlua's default, [`Lua`] is single-threaded out of the box: it is built
+//! on `Rc`, so it is neither `Send` nor `Sync`. Clone a [`Lua`] to get another
+//! handle to the same VM.
+//!
+//! With the `send` cargo feature (mirroring mlua's `send`), [`Lua`] and every
+//! handle become **`Send + Sync`**: handles can be moved across threads,
+//! captured in `Arc<dyn Fn + Send + Sync>` containers, and used from several
+//! threads. All VM access is serialized by an internal per-VM re-entrant mutex
+//! (mlua's `ReentrantMutex<RawLua>` design — see `sync.rs`), so at most one
+//! thread is inside the VM at a time; callbacks re-entering the VM on the same
+//! thread do not deadlock.
 //!
 //! ## Deferred (not yet implemented)
 //!
 //! The following parts of mlua's surface are intentionally **out of scope** and
 //! are noted here rather than implemented:
 //!
-//! - Multi-VM `Send`/`Sync` (`WeakLua`, send-able handles) (P4).
 //! - Thread event callbacks (`ThreadEvent`/`ThreadTriggers`/
 //!   `set_thread_event_callback`) and per-thread hooks.
 //! - The `chunk!` proc-macro.

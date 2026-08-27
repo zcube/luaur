@@ -2,7 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::state::{Lua, LuaRef};
-use crate::sync::{NotSync, XRc, NOT_SYNC};
+use crate::sync::XRc;
 use crate::sys::*;
 
 /// A garbage-collected Lua string.
@@ -10,19 +10,17 @@ use crate::sys::*;
 /// Mirrors `mlua::String`. Holds a registry reference to the underlying Lua
 /// string so the bytes stay alive for the handle's lifetime.
 ///
-/// Under the `send` feature it is `Send` but never `Sync` — see
-/// [`crate::sync::NotSync`].
+/// Under the `send` feature it is `Send + Sync` (all VM access is
+/// serialized by the per-VM lock — see [`crate::state::StateRef`]).
 #[derive(Clone)]
 pub struct LuaString {
     pub(crate) reference: XRc<LuaRef>,
-    pub(crate) _not_sync: NotSync,
 }
 
 impl LuaString {
     pub(crate) fn from_ref(reference: LuaRef) -> LuaString {
         LuaString {
             reference: XRc::new(reference),
-            _not_sync: NOT_SYNC,
         }
     }
 
@@ -37,6 +35,7 @@ impl LuaString {
     /// than a borrowed guard — a deliberate simplification).
     pub fn as_bytes(&self) -> Vec<u8> {
         let state = self.reference.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             let mut len = 0usize;
@@ -82,6 +81,7 @@ impl LuaString {
     /// comparison). Mirrors `mlua::String::to_pointer`.
     pub fn to_pointer(&self) -> *const std::ffi::c_void {
         let state = self.reference.state();
+        let state = state.get();
         unsafe {
             self.reference.push();
             let p = lua_topointer(state, -1);
@@ -217,6 +217,7 @@ impl PartialEq<std::borrow::Cow<'_, [u8]>> for LuaString {
 /// handle. Used by [`Lua::create_string`].
 pub(crate) fn create_string(lua: &Lua, bytes: &[u8]) -> LuaString {
     let state = lua.state();
+    let state = state.get();
     unsafe {
         lua_pushlstring(state, bytes.as_ptr() as *const c_char, bytes.len());
         LuaString::from_ref(lua.pop_ref())

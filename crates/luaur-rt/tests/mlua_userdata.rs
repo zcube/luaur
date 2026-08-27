@@ -226,10 +226,8 @@ fn test_metamethods() -> Result<()> {
     // Arithmetic/comparison meta-methods used from Lua. luaur-rt meta-methods
     // receive `&self` and the other operand; we return a number, keeping mlua's
     // intent of "the `__add`/`__sub` metamethods fire and compute the result".
-    //
-    // DEVIATION: luaur-rt reserves `__index` on a userdata's metatable for its
-    // method table, so a *custom* `__index` function (mlua's `MetaMethod::Index`
-    // on a userdata that also has methods) is not exercised here.
+    // (A *custom* `__index` alongside methods/fields is exercised separately in
+    // `test_meta_index_*` below.)
     struct MyUserData(i64);
 
     impl UserData for MyUserData {
@@ -359,4 +357,119 @@ fn test_userdata_drop_runs_destructor() -> Result<()> {
     );
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Custom `__index` / `__newindex` meta-methods must compose with the method
+// table and field getters/setters instead of being overwritten by them (mlua's
+// chain: field accessor → method table → user handler). Regression tests for
+// the dispatcher in `create_userdata` / `create_scoped_userdata` — without it,
+// `add_meta_method(MetaMethod::Index, ..)` was silently replaced by the method
+// table and dynamic lookups came back as "attempt to call a nil value"
+// (bevy_mod_scripting's `world.get_type_by_name` died exactly this way).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_meta_index_without_fields() -> Result<()> {
+    struct Dynamic;
+
+    impl UserData for Dynamic {
+        fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+            methods.add_method("real", |_, _, ()| Ok("method"));
+            methods.add_meta_method(MetaMethod::Index, |_, _, key: String| {
+                Ok(format!("dyn:{key}"))
+            });
+        }
+    }
+
+    let lua = Lua::new();
+    lua.globals().set("ud", lua.create_userdata(Dynamic)?)?;
+
+    // The method table still wins for a real method...
+    assert_eq!(lua.load("return ud:real()").eval::<String>()?, "method");
+    // ...and an unknown key falls through to the user `__index` handler.
+    assert_eq!(
+        lua.load("return ud.get_type_by_name").eval::<String>()?,
+        "dyn:get_type_by_name"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_meta_index_with_fields() -> Result<()> {
+    struct Dynamic(i64);
+
+    impl UserData for Dynamic {
+        fn add_fields<F: luaur_rt::UserDataFields<Self>>(fields: &mut F) {
+            fields.add_field_method_get("n", |_, this| Ok(this.0));
+        }
+        fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+            methods.add_method("real", |_, this, ()| Ok(this.0 * 10));
+            methods.add_meta_method(MetaMethod::Index, |_, _, key: String| {
+                Ok(format!("dyn:{key}"))
+            });
+        }
+    }
+
+    let lua = Lua::new();
+    lua.globals().set("ud", lua.create_userdata(Dynamic(4))?)?;
+
+    // Chain: field getter → method table → user `__index` handler.
+    assert_eq!(lua.load("return ud.n").eval::<i64>()?, 4);
+    assert_eq!(lua.load("return ud:real()").eval::<i64>()?, 40);
+    assert_eq!(lua.load("return ud.other").eval::<String>()?, "dyn:other");
+    Ok(())
+}
+
+#[test]
+fn test_meta_newindex_handler() -> Result<()> {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct Sink(Arc<Mutex<Vec<(String, i64)>>>);
+
+    impl UserData for Sink {
+        fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+            methods.add_meta_method(
+                MetaMethod::NewIndex,
+                |_, this, (key, val): (String, i64)| {
+                    this.0.lock().unwrap().push((key, val));
+                    Ok(())
+                },
+            );
+        }
+    }
+
+    let lua = Lua::new();
+    let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+    lua.globals()
+        .set("ud", lua.create_userdata(sink.clone())?)?;
+
+    lua.load("ud.x = 1; ud.y = 2").exec()?;
+    let seen = sink.0.lock().unwrap().clone();
+    assert_eq!(seen, vec![("x".to_string(), 1), ("y".to_string(), 2)]);
+    Ok(())
+}
+
+#[test]
+fn test_meta_index_scoped_userdata() -> Result<()> {
+    struct Dynamic;
+
+    impl UserData for Dynamic {
+        fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+            methods.add_method("real", |_, _, ()| Ok("method"));
+            methods.add_meta_method(MetaMethod::Index, |_, _, key: String| {
+                Ok(format!("dyn:{key}"))
+            });
+        }
+    }
+
+    let lua = Lua::new();
+    lua.scope(|scope| {
+        let ud = scope.create_userdata(Dynamic)?;
+        lua.globals().set("ud", ud)?;
+        assert_eq!(lua.load("return ud:real()").eval::<String>()?, "method");
+        assert_eq!(lua.load("return ud.zzz").eval::<String>()?, "dyn:zzz");
+        Ok(())
+    })
 }
