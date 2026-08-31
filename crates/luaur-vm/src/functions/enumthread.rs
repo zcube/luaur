@@ -14,7 +14,31 @@ use crate::records::proto::Proto;
 use crate::records::t_string::TString;
 use crate::type_aliases::closure::Closure;
 use crate::type_aliases::t_value::TValue;
-use core::ffi::{c_char, c_int};
+use alloc::string::ToString;
+use alloc::vec::Vec;
+use core::ffi::{c_char, CStr};
+
+unsafe fn format_thread_label(
+    debugname: *const c_char,
+    linedefined: i32,
+    source: *const c_char,
+) -> Vec<u8> {
+    let debugname = CStr::from_ptr(debugname).to_bytes();
+    let source = CStr::from_ptr(source).to_bytes();
+    let line = linedefined.to_string();
+
+    let mut label = Vec::with_capacity(
+        b"thread at ".len() + debugname.len() + 1 + line.len() + 1 + source.len() + 1,
+    );
+    label.extend_from_slice(b"thread at ");
+    label.extend_from_slice(debugname);
+    label.push(b':');
+    label.extend_from_slice(line.as_bytes());
+    label.push(b' ');
+    label.extend_from_slice(source);
+    label.push(0);
+    label
+}
 
 #[allow(non_snake_case)]
 pub unsafe fn enumthread(ctx: *mut EnumContext, th: *mut lua_State) {
@@ -36,8 +60,6 @@ pub unsafe fn enumthread(ctx: *mut EnumContext, th: *mut lua_State) {
         let tcl_l = core::ptr::addr_of!((*tcl).inner.l).cast::<crate::records::closure::LClosure>();
         let p: *mut Proto = (*tcl_l).p;
         if !p.is_null() {
-            let mut buf: [c_char; 256] = [0; 256];
-
             let src_str = if !(*p).source.is_null() {
                 getstr((*p).source)
             } else {
@@ -49,16 +71,14 @@ pub unsafe fn enumthread(ctx: *mut EnumContext, th: *mut lua_State) {
                 c"unnamed".as_ptr()
             };
 
-            let _ = snprintf(
-                buf.as_mut_ptr(),
-                buf.len() as u32,
-                c"thread at %s:%d %s".as_ptr(),
-                debugname_str,
-                (*p).linedefined,
-                src_str,
-            );
+            let label = format_thread_label(debugname_str, (*p).linedefined, src_str);
 
-            enumnode(ctx, obj2gco!(th as *mut GCObject), size, buf.as_ptr());
+            enumnode(
+                ctx,
+                obj2gco!(th as *mut GCObject),
+                size,
+                label.as_ptr() as *const c_char,
+            );
         } else {
             enumnode(ctx, obj2gco!(th as *mut GCObject), size, core::ptr::null());
         }
@@ -84,7 +104,22 @@ pub unsafe fn enumthread(ctx: *mut EnumContext, th: *mut lua_State) {
     }
 }
 
-// snprintf is not available in core::ffi, but luau-vm already provides it via lobject.h
-extern "C" {
-    fn snprintf(s: *mut c_char, n: u32, format: *const c_char, ...) -> c_int;
+#[cfg(test)]
+mod tests {
+    use super::format_thread_label;
+
+    #[test]
+    fn thread_label_preserves_source_bytes_and_is_nul_terminated() {
+        let debugname = b"render\xff\0";
+        let source = b"canvas.luau\0";
+        let label = unsafe {
+            format_thread_label(
+                debugname.as_ptr() as *const core::ffi::c_char,
+                -42,
+                source.as_ptr() as *const core::ffi::c_char,
+            )
+        };
+
+        assert_eq!(label, b"thread at render\xff:-42 canvas.luau\0");
+    }
 }
