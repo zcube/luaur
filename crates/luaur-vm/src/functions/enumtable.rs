@@ -23,8 +23,16 @@ use crate::records::lua_table::LuaTable;
 use crate::type_aliases::lua_table::LuaTable as LuaTableAlias;
 use crate::type_aliases::t_value::TValue as TValueAlias;
 use crate::type_aliases::tms::TMS;
+use alloc::string::String;
 use core::ffi::{c_char, c_int};
 use core::ptr;
+use luaur_common::functions::format_g::format_g;
+
+fn format_number_key(value: f64) -> String {
+    let mut label = format_g(value, 14);
+    label.push('\0');
+    label
+}
 
 #[allow(non_snake_case)]
 pub(crate) unsafe fn enumtable(ctx: *mut EnumContext, h: *mut LuaTable) {
@@ -88,23 +96,8 @@ pub(crate) unsafe fn enumtable(ctx: *mut EnumContext, h: *mut LuaTable) {
                     if ttisstring!(&n.key) {
                         enumedge(ctx, obj, gcvalue!(&n.val), svalue!(&n.key));
                     } else if ttisnumber!(&n.key) {
-                        let mut buf = [0i8; 32];
-                        let nvalue_ptr = nvalue!(&n.key);
-                        extern "C" {
-                            fn snprintf(
-                                s: *mut c_char,
-                                n: usize,
-                                format: *const c_char,
-                                ...
-                            ) -> c_int;
-                        }
-                        snprintf(
-                            buf.as_mut_ptr(),
-                            buf.len(),
-                            b"%.14g\0".as_ptr() as *const c_char,
-                            nvalue_ptr,
-                        );
-                        enumedge(ctx, obj, gcvalue!(&n.val), buf.as_ptr());
+                        let label = format_number_key(nvalue!(&n.key));
+                        enumedge(ctx, obj, gcvalue!(&n.val), label.as_ptr() as *const c_char);
                     } else {
                         let mut buf = [0i8; 32];
                         let tt = n.key.tt();
@@ -149,5 +142,23 @@ pub(crate) unsafe fn enumtable(ctx: *mut EnumContext, h: *mut LuaTable) {
             obj2gco!((*h).metatable),
             b"metatable\0".as_ptr() as *const c_char,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_number_key;
+
+    #[test]
+    fn number_key_label_matches_luau_format_and_is_nul_terminated() {
+        for (value, expected) in [
+            (0.0, "0\0"),
+            (-0.0, "-0\0"),
+            (1234.5, "1234.5\0"),
+            (1.0e14, "1e+14\0"),
+            (1.25e-5, "1.25e-05\0"),
+        ] {
+            assert_eq!(format_number_key(value), expected);
+        }
     }
 }
